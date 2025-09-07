@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::ffi::c_void;
 use std::usize;
 
@@ -40,7 +39,7 @@ use std::sync::Arc;
 
 const WARMUP_TRIALS: usize = 0;
 const TRIALS: usize = 1;
-const MAX_SEARCHED_GRAPHS: usize = 100_000;
+const MAX_SEARCHED_GRAPHS: usize = 10_000;
 const MAX_CYCLES: usize = 1;
 const INVALID_IR: &[&str] = &[
     "SwapLoops",
@@ -345,45 +344,9 @@ pub fn search(
         .enumerate()
     {
         // Build termdag
-        let mut graph = extraction_to_graph(&egraph, &trajectory, &loop_level_map);
-        // crate::debug::display_graph2(&graph, &[]);
+        let graph = extraction_to_graph(&egraph, &trajectory, &loop_level_map);
         prev_graphs.push(graph.clone());
         prev_traj.push(trajectory.clone());
-
-        // Dedup GMEMs (don't think we need this?)
-        let mut canon: FxHashMap<String, NodeIndex> = FxHashMap::default();
-
-        for n in graph.node_indices().collect::<Vec<_>>() {
-            if let GraphTerm::GMEM { label } = &graph[n] {
-                match canon.entry(label.clone()) {
-                    Entry::Vacant(e) => {
-                        e.insert(n);
-                    }
-                    Entry::Occupied(e) => {
-                        let c = *e.get();
-                        for src in graph
-                            .neighbors_directed(n, Direction::Incoming)
-                            .collect::<Vec<_>>()
-                        {
-                            graph.update_edge(src, c, ());
-                        }
-                        for dst in graph
-                            .neighbors_directed(n, Direction::Outgoing)
-                            .collect::<Vec<_>>()
-                        {
-                            graph.update_edge(c, dst, ());
-                        }
-                        graph.remove_node(n);
-                    }
-                }
-            }
-        }
-
-        // Build input mapping
-        let node_index_to_init_data: Vec<(NodeIndex, InitData)> = inputs
-            .iter()
-            .filter_map(|(label, data)| canon.get(label).map(|&n| (n, data.clone())))
-            .collect();
 
         let Some((kernels, gmem_mapping)) =
             crate::codegen::codegen(graph.clone(), arch.clone(), dyn_vars)
@@ -391,7 +354,7 @@ pub fn search(
             continue;
         };
         possibles += 1;
-
+        let inputs = inputs.into_iter().filter_map(|(l, d)| graph.node_indices().find(|n| matches!(graph.node_weight(*n).unwrap(), GraphTerm::GMEM { label } if label == l)).map(|i| (i, d.clone()))).collect_vec();
         match &arch {
             GPUArch::CUDA | GPUArch::Metal(_) | GPUArch::OpenCL(_) => {
                 let k = print_kernels(&kernels);
@@ -400,14 +363,7 @@ pub fn search(
                 } else {
                     seen.insert(k);
                 }
-                if let Some((us, outs)) = cost(
-                    &graph,
-                    &kernels,
-                    &node_index_to_init_data,
-                    &gmem_mapping,
-                    dyn_vars,
-                    &arch,
-                ) {
+                if let Some((us, outs)) = cost(&graph, &kernels, &inputs, &gmem_mapping, dyn_vars, &arch) {
                     valid_graphs += 1;
                     if let Some((progress, logs, title, _)) = &ui_functions {
                         progress(((n as f32 / total_trajectories as f32) * 100.0) as u16);
@@ -446,6 +402,72 @@ pub fn search(
                                                 "{} {x} != {y} {}",
                                                 "Output Mismatch".bold().on_bright_red(),
                                                 (x - y).abs()
+                                            );
+                                        }
+                                        continue 'trajectory_loop;
+                                    }
+                                }
+                            }
+                            println!("{}", "Outputs Validated".bold().on_bright_green());
+                        }
+                    }
+                    let kernel_string = print_kernels(&kernels);
+                    if og_kernels.is_empty() {
+                        og_kernels = kernel_string.clone();
+                    }
+                    if us < best_time {
+                        best_time = us;
+                        best_graph = Some(graph);
+                        fastest = kernel_string;
+                    }
+                }
+            }
+            GPUArch::Metal(_) => {
+                let k = print_kernels(&kernels);
+                if seen.contains(&k) {
+                    continue;
+                } else {
+                    seen.insert(k);
+                }
+                if let Some((us, outs)) = cost(&graph, &kernels, &inputs, &gmem_mapping, dyn_vars, &arch) {
+                    valid_graphs += 1;
+                    if let Some((progress, logs, title, _)) = &ui_functions {
+                        progress(((n as f32 / total_trajectories as f32) * 100.0) as u16);
+                        logs(print_kernels(&kernels));
+                        title(format!("Graph {valid_graphs} {us}µs"));
+                    } else if option_env!("DEBUG").is_some() {
+                        println!("{}", print_kernels(&kernels));
+                        println!("Graph {valid_graphs} {us}µs");
+                        if ref_outputs.is_empty() {
+                            ref_outputs = outs;
+                            println!("{}", "Initial".bold().on_bright_green());
+                        } else {
+                            for (a, b) in ref_outputs.iter().zip(&outs) {
+                                for (x, y) in a.iter().zip(b) {
+                                    if (x - y).abs() >= 1e-1 {
+                                        if option_env!("DEBUG").is_some() {
+                                            // display_graph(&graph, &[]);
+                                            println!(
+                                                "REF: {:?}",
+                                                &ref_outputs
+                                                    .iter()
+                                                    .map(|v| &v[..v.len().min(20)])
+                                                    .collect_vec()
+                                            );
+                                            println!(
+                                                "New: {:?}",
+                                                &outs
+                                                    .iter()
+                                                    .map(|v| &v[..v.len().min(20)])
+                                                    .collect_vec()
+                                            );
+                                            // crate::utils::generate_proof(&og, &graph);
+                                            println!("{}", og_kernels);
+                                            println!("{}", print_kernels(&kernels));
+                                            crate::debug::display_multiple_graphs(&[&og, &graph]);
+                                            panic!(
+                                                "{} {x} != {y}",
+                                                "Output Mismatch".bold().on_bright_red()
                                             );
                                         }
                                         continue 'trajectory_loop;

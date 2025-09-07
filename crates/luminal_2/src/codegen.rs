@@ -68,7 +68,7 @@ pub fn codegen(
     });
     let mut gmem_mapping: HashMap<NodeIndex, usize> = HashMap::new();
     let mut gmem_names = FxHashMap::default();
-    for (n_kernel, (_, inputs, _, _)) in kernels.iter().enumerate() {
+    for (n_kernel, (_, inputs, _)) in kernels.iter().enumerate() {
         for (n_input, (input_kernel, _)) in inputs.into_iter().enumerate() {
             match input_kernel {
                 GMEMBuffer::PrevKernel { kernel, output } => kernel_meta_graph.add_edge(
@@ -103,7 +103,6 @@ pub fn codegen(
             (output_index, i),
         );
     }
-    // display_graph2(&kernel_meta_graph, &[]);
     let Ok(t) = toposort(&kernel_meta_graph, None) else {
         // TODO: for some reason sometimes there are cycles in the kernel graph
         return None;
@@ -112,7 +111,7 @@ pub fn codegen(
         if kernels.len() <= node.index() {
             continue; // Either input node or output node
         }
-        let (kernel_graph, inputs, outputs, smem_buffers) = kernels[node.index()].clone();
+        let (kernel_graph, inputs, outputs) = kernels[node.index()].clone();
         // Handle custom kernels
         if kernel_graph
             .node_weights()
@@ -152,7 +151,6 @@ pub fn codegen(
             .iter()
             .map(|(_, n)| *n)
             .chain(outputs.iter().map(|(_, i)| *i))
-            .chain(smem_buffers.iter().map(|(_, i, _)| *i))
             .enumerate()
             .map(|(v, n)| (n, (v, true)))
             .collect::<HashMap<_, _>>();
@@ -160,13 +158,6 @@ pub fn codegen(
             match arch {
                 GPUArch::Metal(_) => arch.add_pointer_qualifier(*n, "device "),
                 GPUArch::OpenCL(_) => arch.add_pointer_qualifier(*n, "__global "),
-                _ => {}
-            }
-        }
-        for (n, _, _) in &smem_buffers {
-            match arch {
-                GPUArch::Metal(_) => arch.add_pointer_qualifier(*n, "threadgroup "),
-                GPUArch::OpenCL(_) => arch.add_pointer_qualifier(*n, "__local "),
                 _ => {}
             }
         }
@@ -178,10 +169,6 @@ pub fn codegen(
             &mut (inputs.len() + outputs.len()),
             &mut loop_levels,
             &mut HashMap::new(),
-            &smem_buffers
-                .iter()
-                .map(|(ind, node, _)| (*node, *ind))
-                .collect(),
             0,
             0,
             &mut arch,
@@ -226,25 +213,9 @@ pub fn codegen(
                             .map(|(c, _)| format!("const size_t const_{c}")),
                     )
                     .join(", ");
-                let smem_setup = if smem_buffers.is_empty() {
-                    "".to_string()
-                } else {
-                    format!(
-                        "\textern __shared__ float sm[];\n{}",
-                        smem_buffers
-                            .iter()
-                            .scan("".to_string(), |prev_buffers, (n, _, size)| {
-                                let r =
-                                    format!("\tfloat* {} = sm{prev_buffers};\n", var_to_char(*n));
-                                prev_buffers.push_str(&format!(" + {size}"));
-                                Some(r)
-                            })
-                            .join("")
-                    )
-                };
                 format!(
                     "extern \"C\" __global__ void kernel_name({inputs}) {{
-{smem_setup}{kernel_lines}
+{kernel_lines}
 }}"
                 )
             }
@@ -280,33 +251,15 @@ pub fn codegen(
                     }))
                     .collect_vec();
                 *input_string.last_mut().unwrap() = input_string.last().unwrap().replace(",", " ");
-                let (smem_setup, smem_input) = if smem_buffers.is_empty() {
-                    ("".to_string(), "".to_string())
-                } else {
-                    (
-                        smem_buffers
-                            .iter()
-                            .scan("".to_string(), |prev_buffers, (n, _, size)| {
-                                let r = format!(
-                                    "\tthreadgroup float* {} = sm{prev_buffers};\n",
-                                    var_to_char(*n)
-                                );
-                                prev_buffers.push_str(&format!(" + {size}"));
-                                Some(r)
-                            })
-                            .join(""),
-                        ", threadgroup float* sm [[threadgroup(0)]]".to_string(),
-                    )
-                };
                 format!(
                     "#include <metal_stdlib>
 using namespace metal;
 kernel void kernel_name(
 	uint3 blockIdx [[threadgroup_position_in_grid]],
 	uint3 threadIdx [[thread_position_in_threadgroup]],
-	{}{smem_input}
+	{}
 ) {{
-{smem_setup}{kernel_lines}
+{kernel_lines}
 }}",
                     input_string.join("\n\t")
                 )
@@ -326,25 +279,9 @@ kernel void kernel_name(
                         .sorted_by_key(|(k, _)| **k)
                         .map(|(c, _)| format!("const int const_{c}")),
                 );
-                if !smem_buffers.is_empty() {
-                    args.push("__local float* sm".to_string());
-                }
-
-                let smem_setup = if smem_buffers.is_empty() {
-                    "".to_string()
-                } else {
-                    smem_buffers
-                        .iter()
-                        .scan("".to_string(), |prev_buffers, (n, _, size)| {
-                            let r = format!("\t__local float* {} = sm{prev_buffers};\n", var_to_char(*n));
-                            prev_buffers.push_str(&format!(" + {size}"));
-                            Some(r)
-                        })
-                        .join("")
-                };
                 format!(
                     "__kernel void kernel_name({}) {{
-{smem_setup}{kernel_lines}
+{kernel_lines}
 }}",
                     args.join(", ")
                 )
@@ -356,8 +293,6 @@ kernel void kernel_name(
             .unwrap()
             > MAX_THREADBLOCK_SIZE
         {
-            // println!("Tb too big: {:?}", threadblock);
-            // println!("{kernel}");
             return None;
         }
         if grid[0].exec(dyn_vars).unwrap() > MAX_GRID_X {
@@ -373,7 +308,7 @@ kernel void kernel_name(
             code: kernel,
             grid: (grid[0], grid[1], grid[2]),
             threadblock: (threadblock[0], threadblock[1], threadblock[2]),
-            smem: smem_buffers.into_iter().map(|(_, _, a)| a).sum(),
+            smem: 0.into(),
             outputs: outputs.into_iter().map(|(o, _)| o.simplify()).collect(),
         };
     }
@@ -395,7 +330,6 @@ fn make_kernel(
     prev_max_var: &mut usize, // contains the char last used
     tracked_loop_levels: &mut Vec<Expression>,
     loop_indexes: &mut HashMap<NodeIndex, usize>,
-    smem_buffers: &HashMap<NodeIndex, usize>,
     mut current_loop_level: usize,
     unpadded_loop_level: usize,
     arch: &mut GPUArch,
@@ -585,6 +519,12 @@ fn make_kernel(
                     if !stride.is_acc() && !node_to_var.contains_key(&dest) {
                         // Handle the case where the dest is not the real loop output
                         let size = stride.substitute('z', range).max(1);
+                        if current_loop_level < THREADBLOCK_DIMS + GRID_DIMS {
+                            if std::env::var("PRINT_REJECT").is_ok() {
+                                println!("too low?");
+                            }
+                            return None;
+                        }
                         // We don't have a place to save this output to. Need to allocate a register buffer
                         *prev_max_var += 1;
                         let qualifier = match &*arch {
@@ -729,7 +669,6 @@ fn make_kernel(
                     prev_max_var,
                     tracked_loop_levels,
                     loop_indexes,
-                    smem_buffers,
                     current_loop_level + 1,
                     unpadded_loop_level + 1,
                     arch,
@@ -1072,10 +1011,9 @@ fn split_kernels(
     graph: StableGraph<GraphTerm, (), Directed>,
 ) -> (
     Vec<(
-        StableGraph<(GraphTerm, usize), (), Directed>,
-        Vec<(GMEMBuffer, NodeIndex)>, // (src buffer, current graph node)
-        Vec<(Expression, NodeIndex)>, // output node
-        Vec<(usize, NodeIndex, Expression)>, // (shared memory buffer name, node, buffer size)
+        StableGraph<(GraphTerm, usize), (), Directed>, // graph of (term, loop leve)
+        Vec<(GMEMBuffer, NodeIndex)>,                  // (src buffer, current graph node)
+        Vec<(Expression, NodeIndex)>,                  // output node
     )>,
     Vec<(usize, usize)>, // Output kernels
 ) {
@@ -1261,14 +1199,14 @@ fn split_kernels(
         .max()
         .expect("No kernels found!?");
     let mut kernel_graphs = (0..n_kernels)
-        .map(|_| (StableGraph::new(), vec![], vec![], vec![]))
+        .map(|_| (StableGraph::new(), vec![], vec![]))
         .collect_vec();
     let mut node_maps = (0..n_kernels).map(|_| HashMap::new()).collect_vec();
     let mut final_outputs = HashMap::new();
     for node in marked_graph.node_indices() {
         let (term, loop_level, kernels) = &marked_graph[node];
         for kernel in kernels {
-            let (kernel_graph, _, curr_outputs, _) = &mut kernel_graphs[*kernel];
+            let (kernel_graph, _, curr_outputs) = &mut kernel_graphs[*kernel];
             node_maps[*kernel].insert(
                 node,
                 kernel_graph.add_node((term.clone(), loop_level.len())),
@@ -1334,40 +1272,7 @@ fn split_kernels(
     }
 
     // Go through SMEM buffers
-    for (kernel_graph, inputs, outputs, smem_buffers) in &mut kernel_graphs {
-        for node in kernel_graph.node_indices() {
-            if let (GraphTerm::SMEM, _) = kernel_graph[node] {
-                // Walk forward until load to find the size
-                for mut curr in kernel_graph.neighbors_directed(node, Direction::Outgoing) {
-                    let mut size = Expression::from(1);
-                    let mut load = false;
-                    loop {
-                        match kernel_graph[curr].0 {
-                            GraphTerm::LoopIn { range, stride, .. } => {
-                                if stride != 0 {
-                                    size *= range;
-                                }
-                                curr = kernel_graph
-                                    .neighbors_directed(curr, Direction::Outgoing)
-                                    .next()
-                                    .unwrap();
-                            }
-                            GraphTerm::SMEMLoad => {
-                                load = true;
-                                break;
-                            }
-                            _ => break,
-                        }
-                    }
-                    if load {
-                        let buf_index = inputs.len() + outputs.len() + smem_buffers.len();
-                        smem_buffers.push((buf_index, node, size));
-                        break;
-                    }
-                }
-            }
-        }
-
+    for (kernel_graph, inputs, outputs) in &mut kernel_graphs {
         // Ensure GMEM is placed on the graph
         for (_, input) in inputs {
             if !matches!(kernel_graph[*input].0, GraphTerm::GMEM { .. }) {
