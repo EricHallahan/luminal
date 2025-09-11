@@ -226,7 +226,7 @@ pub fn codegen(
                             if let GMEMBuffer::Input { node } = buf {
                                 format!(" // GMEM({})", gmem_names[&node])
                             } else {
-                                "// From previous kernel".to_string()
+                                " // From previous kernel".to_string()
                             }
                         )
                     })
