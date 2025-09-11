@@ -1,5 +1,6 @@
 pub mod codegen;
 pub mod debug;
+pub mod egraph_debugger;
 pub mod extract;
 pub mod run;
 pub mod translate;

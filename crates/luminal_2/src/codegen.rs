@@ -145,8 +145,9 @@ pub fn codegen(
             continue;
         }
 
-        validate_graph(&kernel_graph);
-        // display_graph(&kernel_graph, &[]);
+        if std::env::var("DEBUG").is_ok() {
+            validate_graph(&kernel_graph);
+        }
         let mut node_to_var = inputs
             .iter()
             .map(|(_, n)| *n)
@@ -187,15 +188,8 @@ pub fn codegen(
             .chain(repeat(1.into()))
             .take(3) // Hardware always expects 3 dims
             .collect_vec();
-        // Make sure there are no dynamic dimensions in the threadblock
-        if threadblock
-            .iter()
-            .copied()
-            .product::<Expression>()
-            .to_usize()
-            .is_none()
-        {
-            println!("dyn in tb");
+        // Make sure there are no dynamic dimensions in the threadblock TODO: why is this not allowed?
+        if threadblock.iter().any(|i| i.to_usize().is_none()) {
             return None;
         }
         let kernel_lines = kernel.into_iter().map(|s| format!("\t{s}")).join("\n");
@@ -232,7 +226,7 @@ pub fn codegen(
                             if let GMEMBuffer::Input { node } = buf {
                                 format!(" // GMEM({})", gmem_names[&node])
                             } else {
-                                "".to_string()
+                                "// From previous kernel".to_string()
                             }
                         )
                     })

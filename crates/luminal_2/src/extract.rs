@@ -4,6 +4,7 @@ use std::usize;
 
 use crate::Kernel;
 use crate::debug::display_graph;
+use crate::egraph_debugger::display_egraph_with_path;
 use crate::run::{assign_buffers, compile_kernels, run_graph};
 use crate::translate::InitData;
 use crate::utils::{build_search_space, generate_proof, print_kernels};
@@ -317,10 +318,18 @@ pub fn search(
     for (id, node) in &egraph.nodes {
         if node.op == "loop_level" {
             for child in &node.children {
-                loop_level_map.insert(child, loop_level_values[egraph.nid_to_cid(id)]);
+                for node in &egraph.classes()[egraph.nid_to_cid(child)].nodes {
+                    loop_level_map.insert(node, loop_level_values[egraph.nid_to_cid(id)]);
+                }
             }
         }
     }
+    // make sure we got all gmems
+    // for (id, node) in &egraph.nodes {
+    //     if node.op == "LoopIn" {
+    //         assert!(loop_level_map.contains_key(id));
+    //     }
+    // }
 
     // Now we have DFS trajectories
     let mut best_graph = None;
@@ -343,6 +352,7 @@ pub fn search(
         .take(MAX_SEARCHED_GRAPHS)
         .enumerate()
     {
+        // display_egraph_with_path(&egraph, &trajectory);
         // Build termdag
         let graph = extraction_to_graph(&egraph, &trajectory, &loop_level_map);
         prev_graphs.push(graph.clone());
@@ -354,7 +364,12 @@ pub fn search(
             continue;
         };
         possibles += 1;
-        let inputs = inputs.into_iter().filter_map(|(l, d)| graph.node_indices().find(|n| matches!(graph.node_weight(*n).unwrap(), GraphTerm::GMEM { label } if label == l)).map(|i| (i, d.clone()))).collect_vec();
+        let inputs = inputs
+        	.into_iter()
+         	.filter_map(|(l, d)|
+          		graph.node_indices().find(|n| matches!(graph.node_weight(*n).unwrap(), GraphTerm::GMEM { label } if label == l)).map(|i| (i, d))
+          	)
+          	.collect_vec();
         match &arch {
             GPUArch::CUDA | GPUArch::Metal(_) | GPUArch::OpenCL(_) => {
                 let k = print_kernels(&kernels);
@@ -585,6 +600,10 @@ pub fn extraction_to_graph(
                 } else if let Some(n) = prev_placed.get(node_choice) {
                     Ret::Expr(*n)
                 } else {
+                    if loop_level_map.get(node_choice).is_none() {
+                        display_graph(&g);
+                        panic!();
+                    }
                     let r = g.add_node(match enode.op.as_str() {
                         "LoopIn" => GraphTerm::LoopIn {
                             range,
@@ -967,71 +986,59 @@ pub fn extraction_to_graph(
 fn cost<'a>(
     graph: &StableGraph<GraphTerm, ()>,
     kernels: &StableGraph<Kernel, (usize, usize), Directed>,
-    inputs: &[(NodeIndex, InitData)],
+    inputs: &[(NodeIndex, &InitData)],
     gmem_mapping: &HashMap<NodeIndex, usize>,
     dyn_vars: &FxHashMap<char, usize>,
     arch: &GPUArch,
 ) -> Option<(Cost, Vec<Vec<f32>>)> {
-    with_autoreleasepool(|| match arch {
-        GPUArch::Metal(_) => {
+    with_autoreleasepool(|| {
+        // Get buffer info
+        let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
+        let compiled_kernels = compile_kernels(&kernels);
+        #[cfg(feature = "metal")]
+        let device = MTLCreateSystemDefaultDevice().unwrap();
+        #[cfg(feature = "cuda")]
+        let ctx = CudaContext::new(0).unwrap(); // will need to expand beyond single host
+        // Copy input buffers over
+        let mut inputs = inputs
+            .into_iter()
+            .filter(|(n, _)| gmem_mapping.contains_key(n))
+            .map(|(n, b)| {
+                (
+                    gmem_mapping[n],
+                    (
+                        #[cfg(feature = "metal")]
+                        match b {
+                            InitData::Data(d) => copy_metal_buffer(d, &device),
+                            InitData::Expr(e) => {
+                                copy_metal_buffer(&vec![e.exec(dyn_vars).unwrap() as f32], &device)
+                            }
+                        },
+                        #[cfg(feature = "cuda")]
+                        match b {
+                            InitData::Data(d) => copy_cuda_buffer(d, &device),
+                            InitData::Expr(e) => copy_cuda_buffer(
+                                &vec![e.exec(dyn_vars).unwrap() as f32],
+                                ctx.clone(),
+                            ),
+                        },
+                        false,
+                    ),
+                )
+            })
+            .collect::<FxHashMap<_, _>>();
+        // Warm up resources (buffer allocation, kernel compiler, etc.)
+        for _ in 0..WARMUP_TRIALS {
             #[cfg(feature = "metal")]
-            {
-                let device = MTLCreateSystemDefaultDevice().unwrap();
-                let compiled_kernels = compile_kernels(kernels);
-                let (int_buffers, int_buffer_map) = assign_buffers(kernels);
-                let mut metal_inputs = inputs
-                    .iter()
-                    .filter_map(|(n, b)| {
-                        gmem_mapping.get(n).map(|&idx| {
-                            (
-                                idx,
-                                (
-                                    copy_metal_buffer(&b.clone().to_vec(dyn_vars), &device),
-                                    false,
-                                ),
-                            )
-                        })
-                    })
-                    .collect::<FxHashMap<_, _>>();
-
-                for _ in 0..WARMUP_TRIALS {
-                    run_graph(
-                        graph,
-                        &mut metal_inputs,
-                        kernels,
-                        dyn_vars,
-                        &compiled_kernels,
-                        &int_buffers,
-                        &int_buffer_map,
-                    );
-                }
-
-                let mut micros = vec![];
-                let mut outputs = vec![];
-                for _ in 0..TRIALS {
-                    let (o, m) = run_graph(
-                        graph,
-                        &mut metal_inputs,
-                        kernels,
-                        dyn_vars,
-                        &compiled_kernels,
-                        &int_buffers,
-                        &int_buffer_map,
-                    );
-                    outputs = o;
-                    micros.push(m);
-                }
-                Some((
-                    micros.iter().sum::<u128>() / (TRIALS as u128).max(1),
-                    outputs.iter().map(copy_metal_buffer_back).collect(),
-                ))
-            }
-            #[cfg(not(feature = "metal"))]
-            {
-                None
-            }
-        }
-        GPUArch::CUDA => {
+            run_graph(
+                &graph,
+                &mut inputs,
+                &kernels,
+                dyn_vars,
+                &compiled_kernels,
+                &int_buffers,
+                &int_buffer_map,
+            );
             #[cfg(feature = "cuda")]
             {
                 let ctx = CudaContext::new(0).unwrap();

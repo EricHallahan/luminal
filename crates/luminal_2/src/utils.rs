@@ -143,17 +143,17 @@ pub fn validate_graph(graph: &StableGraph<(GraphTerm, usize), (), Directed>) {
                 }
             }
 
-            // if graph
-            //     .neighbors_directed(node, Direction::Incoming)
-            //     .next()
-            //     .is_none()
-            //     && !matches!(graph.node_weight(node).unwrap().0, GraphTerm::SMEM)
-            // {
-            //     if *curr_level != 0 {
-            //         display_graph(graph);
-            //         panic!("Inputs must have level 0, found {curr_level}");
-            //     }
-            // }
+            if graph
+                .neighbors_directed(node, Direction::Incoming)
+                .next()
+                .is_none()
+                && !matches!(graph.node_weight(node).unwrap().0, GraphTerm::SMEM)
+            {
+                if *curr_level != 0 {
+                    display_graph(graph);
+                    panic!("Inputs must have level 0, found {curr_level}");
+                }
+            }
         }
     }
 }

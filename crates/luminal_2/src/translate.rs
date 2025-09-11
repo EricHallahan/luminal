@@ -16,15 +16,6 @@ pub enum InitData {
     Data(Vec<f32>),
 }
 
-impl InitData {
-    pub fn to_vec(self, dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
-        match self {
-            InitData::Data(d) => d,
-            InitData::Expr(e) => vec![e.exec(dyn_map).unwrap() as f32],
-        }
-    }
-}
-
 pub type CrossSubGraphTensorIndexes = (NodeIndex, NodeIndex);
 pub type MetaGraphNodeIndex = NodeIndex;
 pub type SubGraphNodeIndex = NodeIndex;

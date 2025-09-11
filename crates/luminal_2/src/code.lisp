@@ -63,7 +63,7 @@
 (rewrite (MReplace (MVar ?v) (MVar ?x) ?y) (MVar ?v) :when ((!= ?v ?x)) :ruleset expr)
 
 (ruleset cleanup)
-(rule ((= e (MReplace a b c))) ((delete (MReplace a b c))) :ruleset cleanup)
+;(rule ((= e (MReplace a b c))) ((delete (MReplace a b c))) :ruleset cleanup)
 
 ; -------- IR --------
 (ruleset ir)
@@ -99,10 +99,6 @@
     (MergeLoops IR String String) ; Merge loops, identified by their strings
     (Fused IR) ; Says that we have previously fused a loopout -> loopin here
 
-   	; propogation pattern helpers
-   	(PropOneArg String IR String) ; Generic prop one arg back
-   	(PropTwoArgs String IR String String) ; Generic prop two args back
-
    	; tensor core stuff
    	(TCMatmul IR IR Expression Expression Expression Expression Expression Expression) ; input A, input B, A k stride, B k stride, A inner stride, B inner stride, C inner stride, number of K tile loops
    	(TiledMatmulInputA IR i64 Expression)
@@ -110,33 +106,32 @@
 )
 
 ; -------------- HELPERS ---------------
-
-; Communative binary ops
-;(rewrite (Binary ?bin ?a ?b) (Binary ?bin ?b ?a) :ruleset ir)
-; distributive/associative skeletons so sums and products re-associate
-;(rewrite (Add (Add ?a ?b) ?c) (Add ?a (Add ?b ?c)) :ruleset ir)
-;(rewrite (Mul (Mul ?a ?b) ?c) (Mul ?a (Mul ?b ?c)) :ruleset ir)
-
-; set containing maccums
 (sort ExpressionSetBase (Set Expression))
+(sort IRSetBase (Set IR))
 
-; a single global set, merged by union
 (function MAccumSet () ExpressionSetBase :merge (set-union old new))
-
-; for every (MAccum ...), add that exact term to the set
 (rule
 	((= ?e (MAccum ?s)))
 	((set (MAccumSet) (set-of ?e)))
 	:ruleset ir-prop
 )
+(function LoopInSet () IRSetBase :merge (set-union old new))
+(rule
+	((= e (LoopIn x y z)))
+	((set (LoopInSet) (set-of e)))
+	:ruleset ir-prop
+)
 
-(function loop_level (IR) i64 :merge (max new old))
+(function loop_level (IR) i64 :merge new)
 ; GMEM (0) -> loopin (0)
 (rule
-	((= out (LoopIn (GMEM g) l1 r1)))
+	(
+		(= out (LoopIn g l1 r1))
+		(= g (GMEM x))
+	)
 	(
 		(set (loop_level out) 0)
-		(set (loop_level (GMEM g)) 0)
+		(set (loop_level g) 0)
 	)
 	:ruleset ir-prop
 )
@@ -144,40 +139,10 @@
 (rule
 	(
 		(= curr (LoopOut x l1 r1))
-		(!= x (LoopIn y l2 r2))
+		(set-not-contains (LoopInSet) x)
 		(= xll (loop_level x))
 	)
 	((set (loop_level curr) (- xll 1)))
-	:ruleset ir-prop
-)
-; loopin (n) -> binary (n + 1)
-(rule
-	(
-		(= curr (Binary bin x z))
-		(= x (LoopIn y l1 r1))
-		(= xll (loop_level x))
-	)
-	((set (loop_level curr) (+ xll 1)))
-	:ruleset ir-prop
-)
-; loopin (n) -> unary (n + 1)
-(rule
-	(
-		(= curr (Unary un x))
-		(= x (LoopIn y l1 r1))
-		(= xll (loop_level x))
-	)
-	((set (loop_level curr) (+ xll 1)))
-	:ruleset ir-prop
-)
-; loopin (n) -> loopin (n + 1)
-(rule
-	(
-		(= curr (LoopIn x l2 r2))
-		(= x (LoopIn y l1 r1))
-		(= xll (loop_level x))
-	)
-	((set (loop_level curr) (+ xll 1)))
 	:ruleset ir-prop
 )
 ; loopin (n) -> loopout (n)
@@ -188,6 +153,16 @@
 		(= xll (loop_level x))
 	)
 	((set (loop_level curr) xll))
+	:ruleset ir-prop
+)
+; loopin (n) -> loopin (n + 1)
+(rule
+	(
+		(= curr (LoopIn x l2 r2))
+		(set-contains (LoopInSet) x)
+		(= xll (loop_level x))
+	)
+	((set (loop_level curr) (+ xll 1)))
 	:ruleset ir-prop
 )
 ; loopout (n) -> loopin (n)
@@ -204,20 +179,49 @@
 (rule
 	(
 		(= curr (Binary bin a b))
-		(!= a (LoopIn c l2 r2))
+		(set-not-contains (LoopInSet) a)
 		(= xll (loop_level a))
 	)
 	((set (loop_level curr) xll))
+	:ruleset ir-prop
+)
+; loopin (n) -> binary (n + 1)
+(rule
+	(
+		(= curr (Binary bin a b))
+		(= a (LoopIn in1 l1 r1))
+		(= xll (loop_level a))
+	)
+	((set (loop_level curr) (+ xll 1)))
 	:ruleset ir-prop
 )
 ; non-loopin -> unary
 (rule
 	(
 		(= curr (Unary un a))
-		(!= a (LoopIn c l2 r2))
+		(set-not-contains (LoopInSet) a)
 		(= xll (loop_level a))
 	)
 	((set (loop_level curr) xll))
+	:ruleset ir-prop
+)
+; loopin (n) -> unary (n + 1)
+(rule
+	(
+		(= curr (Unary un a))
+		(= a (LoopIn in1 l1 r1))
+		(= xll (loop_level a))
+	)
+	((set (loop_level curr) (+ xll 1)))
+	:ruleset ir-prop
+)
+; something -> fused
+(rule
+	(
+		(= curr (Fused x))
+		(= xll (loop_level x))
+	)
+	((set (loop_level curr) (- xll 1)))
 	:ruleset ir-prop
 )
 ; loopin -> tcmatmul
@@ -257,11 +261,31 @@
 	 :ruleset ir
 )
 (rewrite
-	(LoopIn (LoopIn (LoopIn
-		(LoopOut (LoopOut (LoopOut
-			(Binary ?bin ?a ?b)
-		(Loop ?loopA1 ?range1) ?st1) (Loop ?loopA2 ?range2) ?st2) (Loop ?loopA3 ?range3) ?st3)
-	(Loop ?loopB3 ?range3) ?st3) (Loop ?loopB2 ?range2) ?st2) (Loop ?loopB1 ?range1) ?st1)
+	(LoopIn
+		(LoopIn
+			(LoopIn
+				(LoopOut
+					(LoopOut
+						(LoopOut
+							(Binary ?bin ?a ?b)
+							(Loop ?loopA1 ?range1)
+							?st1
+						)
+						(Loop ?loopA2 ?range2)
+						?st2
+					)
+					(Loop ?loopA3 ?range3)
+					?st3
+				)
+				(Loop ?loopB3 ?range3)
+				?st3
+			)
+			(Loop ?loopB2 ?range2)
+			?st2
+		)
+		(Loop ?loopB1 ?range1)
+		?st1
+	)
 	(Fused (Binary ?bin ?a ?b))
 	:ruleset ir
 )
@@ -275,7 +299,7 @@
 		(LoopOut (LoopOut (Unary ?un ?a) (Loop ?loopA1 ?range1) ?st1) (Loop ?loopA2 ?range2) ?st2)
 	(Loop ?loopB2 ?range2) ?st2) (Loop ?loopB1 ?range1) ?st1)
 	(Fused (Unary ?un ?a))
-	 :ruleset ir
+	:ruleset ir
 )
 (rewrite
 	(LoopIn (LoopIn (LoopIn
@@ -411,7 +435,7 @@
 		(MVar "z")
 	)
 	(TiledMatmulInputA ?a ?k (MNum (/ ?k 8)))
-	;:when ((= (% ?k 8) 0) (= (% ?m 8) 0) (= (% ?n 8) 0))
+	:when ((= (% ?k 8) 0) (= (% ?m 8) 0) (= (% ?n 8) 0))
 	:ruleset tc
 )
 (rewrite
@@ -429,7 +453,7 @@
 		(MMul (MVar "z") (MNum ?n))
 	)
 	(TiledMatmulInputB ?b ?n (MNum (/ ?k 8)))
-	;:when ((= (% ?k 8) 0) (= (% ?m 8) 0) (= (% ?n 8) 0))
+	:when ((= (% ?k 8) 0) (= (% ?m 8) 0) (= (% ?n 8) 0))
 	:ruleset tc
 )
 (rewrite
@@ -617,14 +641,15 @@
 (run-schedule
 	(saturate expr)
 	(let-scheduler bo (back-off))
+	(saturate ir-prop)
 	(repeat 1
 		(run-with bo ir)
 		(saturate ir-prop)
 		(saturate expr)
-		(saturate cleanup)
 	)
 	(saturate ir-prop)
 	(saturate tc)
+	(saturate ir-prop)
 	(saturate loop-unname) ; TODO: we need to get rid of loop names entirely
 )
 
