@@ -435,7 +435,7 @@
 		(MVar "z")
 	)
 	(TiledMatmulInputA ?a ?k (MNum (/ ?k 8)))
-	:when ((= (% ?k 8) 0) (= (% ?m 8) 0) (= (% ?n 8) 0))
+	:when ((= (loop_level ?a) 0) (= (% ?k 8) 0) (= (% ?m 8) 0) (= (% ?n 8) 0))
 	:ruleset tc
 )
 (rewrite
@@ -453,7 +453,7 @@
 		(MMul (MVar "z") (MNum ?n))
 	)
 	(TiledMatmulInputB ?b ?n (MNum (/ ?k 8)))
-	:when ((= (% ?k 8) 0) (= (% ?m 8) 0) (= (% ?n 8) 0))
+	:when ((= (loop_level ?b) 0) (= (% ?k 8) 0) (= (% ?m 8) 0) (= (% ?n 8) 0))
 	:ruleset tc
 )
 (rewrite

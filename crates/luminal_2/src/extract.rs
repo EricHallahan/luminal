@@ -4,7 +4,6 @@ use std::usize;
 
 use crate::Kernel;
 use crate::debug::display_graph;
-use crate::egraph_debugger::display_egraph_with_path;
 use crate::run::{assign_buffers, compile_kernels, run_graph};
 use crate::translate::InitData;
 use crate::utils::{build_search_space, generate_proof, print_kernels};
@@ -324,12 +323,15 @@ pub fn search(
             }
         }
     }
-    // make sure we got all gmems
-    // for (id, node) in &egraph.nodes {
-    //     if node.op == "LoopIn" {
-    //         assert!(loop_level_map.contains_key(id));
-    //     }
-    // }
+
+    if std::env::var("DEBUG").is_ok() {
+        // make sure all IR nodes loop levels
+        for (id, node) in &egraph.nodes {
+            if node.eclass.to_string().starts_with("IR-") {
+                assert!(loop_level_map.contains_key(id));
+            }
+        }
+    }
 
     // Now we have DFS trajectories
     let mut best_graph = None;
