@@ -57,9 +57,9 @@ fn main() {
         let a = cx.named_tensor("A", (M, K));
         let b = cx.named_tensor("B", (K, N));
         let c = cx.named_tensor("C", (K, N));
-        // let d = cx.named_tensor("D", (N, J));
-        let _out = a.matmul(b).swish() * a.matmul(c);
-        // let _out = (a.matmul(b).swish() * a.matmul(c)).matmul(d);
+        let d = cx.named_tensor("D", (N, J));
+        // let _out = a.matmul(b).swish();
+        let _out = (a.matmul(b).swish() * a.matmul(c)).matmul(d);
 
         let (mut new_graph, mut mapping, accs) = translate_graph(&cx);
         // Search each subgraph
@@ -199,18 +199,18 @@ fn main() {
                 false,
             ),
         );
-        // inputs.insert(
-        //     gmem_mapping[&unified_map[&d.id]],
-        //     (
-        //         copy_buffer(
-        //             &(0..N * J)
-        //                 .map(|_| rng.random_range(-1e-2..1e-2))
-        //                 .collect_vec(),
-        //             device,
-        //         ),
-        //         false,
-        //     ),
-        // );
+        inputs.insert(
+            gmem_mapping[&unified_map[&d.id]],
+            (
+                copy_buffer(
+                    &(0..N * J)
+                        .map(|_| rng.random_range(-1e-2..1e-2))
+                        .collect_vec(),
+                    device,
+                ),
+                false,
+            ),
+        );
         for (label, val) in &accs {
             if let Some(node) = gmem_to_node_mapping.get(label) {
                 if let Some(input_index) = gmem_mapping.get(node) {

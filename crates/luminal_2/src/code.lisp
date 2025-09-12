@@ -375,7 +375,7 @@
 		(MAdd (MReplace ?stO (MVar "z") (MDiv (MVar "z") (MNum ?rangeI))) (MReplace ?stI (MVar "z") (MMod (MVar "z") (MNum ?rangeI))))
 	)
 	:when ((set-not-contains (MAccumSet) ?stI) (set-not-contains (MAccumSet) ?stO))
-	:ruleset ir
+	;:ruleset ir
 )
 (rewrite
 	(MergeLoops
