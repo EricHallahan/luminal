@@ -34,19 +34,33 @@ pub type Function = Retained<ProtocolObject<dyn MTLFunction>>;
 pub enum GPUArch {
     CUDA,
     Metal(HashMap<usize, &'static str>),
+    OpenCL(HashMap<usize, &'static str>),
 }
 
 impl GPUArch {
-    fn metal_buffer_type(&self, var: usize) -> &'static str {
-        match self {
-            Self::Metal(m) => m.get(&var).copied().unwrap_or(""),
+    fn pointer_qualifier(&self, var: usize) -> &'static str {
+         match self {
+            Self::Metal(m) | Self::OpenCL(m) => m.get(&var).copied().unwrap_or(""),
             _ => "",
+         }
+     }
+
+    fn add_pointer_qualifier(&mut self, var: usize, buf_type: &'static str) {
+        if let Self::Metal(m) | Self::OpenCL(m) = self {
+            m.insert(var, buf_type);
         }
     }
 
-    fn add_metal_buffer_type(&mut self, var: usize, buf_type: &'static str) {
-        if let Self::Metal(m) = self {
-            m.insert(var, buf_type);
+    fn thread_ids(&self) -> [&'static str; 3] {
+        match self {
+            GPUArch::CUDA | GPUArch::Metal(_) => ["threadIdx.x", "threadIdx.y", "threadIdx.z"],
+            GPUArch::OpenCL(_) => ["get_local_id(0)", "get_local_id(1)", "get_local_id(2)"],
+        }
+    }
+    fn block_ids(&self) -> [&'static str; 3] {
+        match self {
+            GPUArch::CUDA | GPUArch::Metal(_) => ["blockIdx.x", "blockIdx.y", "blockIdx.z"],
+            GPUArch::OpenCL(_) => ["get_group_id(0)", "get_group_id(1)", "get_group_id(2)"],
         }
     }
 }
@@ -180,6 +194,14 @@ impl Operator for CompatKernel {
     }
 }
 
+#[cfg(feature = "opencl")]
+impl Operator for CompatKernel {
+    fn process(&mut self, _inputs: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        // This is a placeholder. The actual execution happens in the run_graph function.
+        todo!()
+    }
+}
+
 pub fn custom_kernel(
     inputs: &[GraphTensor],
     kernel: Kernel,
@@ -223,6 +245,14 @@ impl Operator for Diff {
 #[cfg(feature = "metal")]
 impl Operator for Diff {
     fn process(&mut self, _inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        todo!()
+    }
+}
+
+#[cfg(feature = "opencl")]
+impl Operator for Diff {
+    fn process(&mut self, _inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        // This is a placeholder. The actual execution happens in the run_graph function.
         todo!()
     }
 }

@@ -1,20 +1,22 @@
 use std::collections::HashMap;
+use std::mem::size_of;
 
 use crate::{
-    GPUArch, GraphTerm,
     codegen::{codegen, stitch_meta_graph_together},
+    debug::display_graph,
     extract::{make_test_inputs, search},
     run::{assign_buffers, compile_kernels, run_graph},
-    translate::{InitData, translate_graph_meta},
+    translate::{translate_graph_meta, InitData},
     utils::build_search_space,
+    GPUArch, GraphTerm,
 };
 use itertools::Itertools;
 use luminal::prelude::{
-    petgraph::{Direction, visit::EdgeRef},
+    petgraph::{visit::EdgeRef, Direction},
     *,
 };
-use metal_rs::{Buffer, Device, MTLResourceOptions, objc::rc::autoreleasepool};
-use rand::{Rng, rng};
+use metal_rs::{objc::rc::autoreleasepool, Buffer, Device, MTLResourceOptions};
+use rand::{rng, Rng};
 use rustc_hash::FxHashMap;
 
 // confirm we generate 1 fused kernel and it runs successfully
@@ -36,9 +38,10 @@ fn e2e_naive_matmul() {
         for graph_node in new_graph.node_indices().collect_vec() {
             let graph = new_graph.node_weight_mut(graph_node).unwrap();
             let search_space = build_search_space(graph, 3);
-            let inputs = make_test_inputs(graph, &cx.dyn_map);
+            let inputs = make_test_inputs(graph, &cx.dyn_map, &accs);
             let searched_graph = search(
-                &search_space,
+                graph,
+                3,
                 &inputs,
                 GPUArch::Metal(HashMap::default()),
                 &cx.dyn_map,
@@ -91,18 +94,17 @@ fn e2e_naive_matmul() {
             }
         }
         let outputs = vec![old_to_new_mapping[&c.id]];
-        let (new_graph, meta_to_unified, outputs) = stitch_meta_graph_together(new_graph, outputs);
+        let (new_graph, meta_to_unified) = stitch_meta_graph_together(new_graph);
         let mut unified_map = FxHashMap::default();
         for (k, v) in old_to_new_mapping {
-            unified_map.insert(k, meta_to_unified[&v]);
+            if let Some(m) = meta_to_unified.get(&v) {
+                unified_map.insert(k, *m);
+            }
         }
         let (kernels, gmem_mapping) = codegen(
             new_graph.clone(),
-            outputs,
             GPUArch::Metal(HashMap::default()),
-            0,
             &cx.dyn_map,
-            true,
         )
         .unwrap();
 
@@ -128,16 +130,17 @@ fn e2e_naive_matmul() {
             match val {
                 InitData::Expr(e) => {
                     let val = e.exec(&cx.dyn_map).unwrap();
-                    inputs.insert(gmem_mapping[&unified_map[label]], {
-                        let v = vec![val as f32];
-                        (copy_metal_buffer(&v, &device), true)
-                    });
+                    if let Some(idx) = unified_map.get(label).and_then(|l| gmem_mapping.get(l)) {
+                        inputs.insert(*idx, {
+                            let v = vec![val as f32];
+                            (copy_metal_buffer(&v, &device), true)
+                        });
+                    }
                 }
                 InitData::Data(d) => {
-                    inputs.insert(
-                        gmem_mapping[&unified_map[&label]],
-                        (copy_metal_buffer(d, &device), true),
-                    );
+                    if let Some(idx) = unified_map.get(label).and_then(|l| gmem_mapping.get(l)) {
+                        inputs.insert(*idx, (copy_metal_buffer(d, &device), true));
+                    }
                 }
             }
         }
@@ -145,6 +148,7 @@ fn e2e_naive_matmul() {
         let compiled_kernels = compile_kernels(&kernels);
         let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
         let (outputs, _) = run_graph(
+            &new_graph,
             &mut inputs,
             &kernels,
             &cx.dyn_map,

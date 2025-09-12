@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ffi::c_void;
-use std::ptr::NonNull;
 use std::usize;
 
 use crate::Kernel;
@@ -25,6 +24,15 @@ use luminal::prelude::petgraph::{Directed, Direction};
 use luminal::shape::{Expression, Term};
 #[cfg(feature = "metal")]
 use objc2_metal::{MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
+#[cfg(feature = "opencl")]
+use opencl3::{
+    command_queue::{CommandQueue, CL_QUEUE_PROFILING_ENABLE},
+    context::Context,
+    device::{Device as OclDevice, CL_DEVICE_TYPE_GPU},
+    memory::{Buffer as OclBuffer, ClMem, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_WRITE},
+    platform::get_platforms,
+    types::CL_TRUE,
+};
 use rand::{Rng, rng};
 use rustc_hash::{FxHashMap, FxHashSet};
 #[cfg(feature = "cuda")]
@@ -55,7 +63,7 @@ where
     objc2::rc::autoreleasepool(|_| f())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 #[inline]
 fn with_autoreleasepool<F, R>(f: F) -> R
 where
@@ -316,10 +324,10 @@ pub fn search(
     }
 
     // Now we have DFS trajectories
-    let mut ref_outputs: Vec<Vec<f32>> = vec![];
+    let mut best_graph = None;
     let mut best_time = u128::MAX;
     let mut fastest = "".to_string();
-    let mut best_graph = None;
+    let mut ref_outputs: Vec<Vec<f32>> = vec![];
     let mut valid_graphs = 0;
     let total_trajectories = trajectories.len().min(MAX_SEARCHED_GRAPHS);
     let mut prev_graphs = vec![];
@@ -383,9 +391,9 @@ pub fn search(
             continue;
         };
         possibles += 1;
-        // let inputs = inputs.into_iter().filter_map(|(l, d)| graph.node_indices().find(|n| matches!(graph.node_weight(*n).unwrap(), GraphTerm::GMEM { label } if label == l)).map(|i| (i, d.clone()))).collect_vec();
+
         match &arch {
-            GPUArch::CUDA => {
+            GPUArch::CUDA | GPUArch::Metal(_) | GPUArch::OpenCL(_) => {
                 let k = print_kernels(&kernels);
                 if seen.contains(&k) {
                     continue;
@@ -398,6 +406,7 @@ pub fn search(
                     &node_index_to_init_data,
                     &gmem_mapping,
                     dyn_vars,
+                    &arch,
                 ) {
                     valid_graphs += 1;
                     if let Some((progress, logs, title, _)) = &ui_functions {
@@ -414,7 +423,6 @@ pub fn search(
                                 for (x, y) in a.iter().zip(b) {
                                     if (x - y).abs() >= 0.1 {
                                         if option_env!("DEBUG").is_some() {
-                                            // display_graph(&graph, &[]);
                                             println!(
                                                 "REF: {:?}",
                                                 &ref_outputs
@@ -458,84 +466,12 @@ pub fn search(
                     }
                 }
             }
-            GPUArch::Metal(_) => {
-                let k = print_kernels(&kernels);
-                if seen.contains(&k) {
-                    continue;
-                } else {
-                    seen.insert(k);
-                }
-                if let Some((us, outs)) = cost(
-                    &graph,
-                    &kernels,
-                    &node_index_to_init_data,
-                    &gmem_mapping,
-                    dyn_vars,
-                ) {
-                    valid_graphs += 1;
-                    if let Some((progress, logs, title, _)) = &ui_functions {
-                        progress(((n as f32 / total_trajectories as f32) * 100.0) as u16);
-                        logs(print_kernels(&kernels));
-                        title(format!("Graph {valid_graphs} {us}µs"));
-                    } else if option_env!("DEBUG").is_some() {
-                        println!("{}", print_kernels(&kernels));
-                        println!("Graph {valid_graphs} {us}µs");
-                        if ref_outputs.is_empty() {
-                            ref_outputs = outs;
-                            println!("{}", "Initial".bold().on_bright_green());
-                        } else {
-                            for (a, b) in ref_outputs.iter().zip(&outs) {
-                                for (x, y) in a.iter().zip(b) {
-                                    if (x - y).abs() >= 1e-1 {
-                                        if option_env!("DEBUG").is_some() {
-                                            // display_graph(&graph, &[]);
-                                            println!(
-                                                "REF: {:?}",
-                                                &ref_outputs
-                                                    .iter()
-                                                    .map(|v| &v[..v.len().min(20)])
-                                                    .collect_vec()
-                                            );
-                                            println!(
-                                                "New: {:?}",
-                                                &outs
-                                                    .iter()
-                                                    .map(|v| &v[..v.len().min(20)])
-                                                    .collect_vec()
-                                            );
-                                            // crate::utils::generate_proof(&og, &graph);
-                                            println!("{}", og_kernels);
-                                            println!("{}", print_kernels(&kernels));
-                                            crate::debug::display_multiple_graphs(&[&og, &graph]);
-                                            panic!(
-                                                "{} {x} != {y}",
-                                                "Output Mismatch".bold().on_bright_red()
-                                            );
-                                        }
-                                        continue 'trajectory_loop;
-                                    }
-                                }
-                            }
-                            println!("{}", "Outputs Validated".bold().on_bright_green());
-                        }
-                    }
-                    let kernel_string = print_kernels(&kernels);
-                    if og_kernels.is_empty() {
-                        og_kernels = kernel_string.clone();
-                    }
-                    if us < best_time {
-                        best_time = us;
-                        best_graph = Some(graph);
-                        fastest = kernel_string;
-                    }
-                }
-            }
         }
     }
     if let Some((_, _, _, e)) = &ui_functions {
         e();
     }
-    println!("FASTEST ({}ms): {fastest}", best_time / 1000);
+    println!("FASTEST ({}µs): {fastest}", best_time);
     println!("Valids: {:?} / {:?}", possibles, total_trajectories);
     best_graph
 }
@@ -863,7 +799,7 @@ pub fn extraction_to_graph(
                     Ret::Expr(r)
                 }
             }
-            "Exp2" | "Sin" | "Recip" | "Neg" | "Sqrt" => {
+            "Exp2" | "Sin" | "Recip" | "Neg" | "Sqrt" | "Log2" => {
                 *current += 1;
                 Ret::Op(match enode.op.as_str() {
                     "Exp2" => GraphTerm::Exp2,
@@ -1012,95 +948,219 @@ fn cost<'a>(
     inputs: &[(NodeIndex, InitData)],
     gmem_mapping: &HashMap<NodeIndex, usize>,
     dyn_vars: &FxHashMap<char, usize>,
+    arch: &GPUArch,
 ) -> Option<(Cost, Vec<Vec<f32>>)> {
-    with_autoreleasepool(|| {
-        // Get buffer info
-        let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
-        let compiled_kernels = compile_kernels(&kernels);
-        #[cfg(feature = "metal")]
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        #[cfg(feature = "cuda")]
-        let ctx = CudaContext::new(0).unwrap(); // will need to expand beyond single host
-        // Copy input buffers over
-        let mut inputs = inputs
-            .into_iter()
-            .filter(|(n, _)| gmem_mapping.contains_key(n))
-            .map(|(n, b)| {
-                (
-                    gmem_mapping[n],
-                    (
-                        #[cfg(feature = "metal")]
-                        copy_metal_buffer(&b.clone().to_vec(dyn_vars), &device),
-                        #[cfg(feature = "cuda")]
-                        copy_cuda_buffer(&b.clone().to_vec(dyn_vars), ctx.clone()),
-                        false,
-                    ),
-                )
-            })
-            .collect::<FxHashMap<_, _>>();
-        // Warm up resources (buffer allocation, kernel compiler, etc.)
-        for _ in 0..WARMUP_TRIALS {
+    with_autoreleasepool(|| match arch {
+        GPUArch::Metal(_) => {
             #[cfg(feature = "metal")]
-            run_graph(
-                &graph,
-                &mut inputs,
-                &kernels,
-                dyn_vars,
-                &compiled_kernels,
-                &int_buffers,
-                &int_buffer_map,
-            );
-            #[cfg(feature = "cuda")]
-            run_graph(
-                &mut inputs,
-                &kernels,
-                dyn_vars,
-                &compiled_kernels,
-                &int_buffers,
-                &int_buffer_map,
-            );
-        }
-        // Test runtime
-        let mut micros = vec![];
-        let mut outputs = vec![];
+            {
+                let device = MTLCreateSystemDefaultDevice().unwrap();
+                let compiled_kernels = compile_kernels(kernels);
+                let (int_buffers, int_buffer_map) = assign_buffers(kernels);
+                let mut metal_inputs = inputs
+                    .iter()
+                    .filter_map(|(n, b)| {
+                        gmem_mapping.get(n).map(|&idx| {
+                            (
+                                idx,
+                                (
+                                    copy_metal_buffer(&b.clone().to_vec(dyn_vars), &device),
+                                    false,
+                                ),
+                            )
+                        })
+                    })
+                    .collect::<FxHashMap<_, _>>();
 
-        for _ in 0..TRIALS {
-            let (o, m_val) = {
-                #[cfg(feature = "metal")]
-                {
+                for _ in 0..WARMUP_TRIALS {
                     run_graph(
-                        &graph,
-                        &mut inputs,
-                        &kernels,
+                        graph,
+                        &mut metal_inputs,
+                        kernels,
                         dyn_vars,
                         &compiled_kernels,
                         &int_buffers,
                         &int_buffer_map,
-                    )
+                    );
                 }
 
-                #[cfg(feature = "cuda")]
-                {
-                    run_graph(
-                        &mut inputs,
-                        &kernels,
+                let mut micros = vec![];
+                let mut outputs = vec![];
+                for _ in 0..TRIALS {
+                    let (o, m) = run_graph(
+                        graph,
+                        &mut metal_inputs,
+                        kernels,
                         dyn_vars,
                         &compiled_kernels,
                         &int_buffers,
                         &int_buffer_map,
-                    )
+                    );
+                    outputs = o;
+                    micros.push(m);
                 }
-            };
-            outputs = o;
-            micros.push(m_val);
+                Some((
+                    micros.iter().sum::<u128>() / (TRIALS as u128).max(1),
+                    outputs.iter().map(copy_metal_buffer_back).collect(),
+                ))
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                None
+            }
         }
-        Some((
-            micros.into_iter().sum::<u128>() / TRIALS as u128,
-            #[cfg(feature = "metal")]
-            outputs.iter().map(copy_metal_buffer_back).collect_vec(),
+        GPUArch::CUDA => {
             #[cfg(feature = "cuda")]
-            outputs.iter().map(copy_cuda_buffer_back).collect_vec(),
-        ))
+            {
+                let ctx = CudaContext::new(0).unwrap();
+                let compiled_kernels = compile_kernels(kernels);
+                let (int_buffers, int_buffer_map) = assign_buffers(kernels);
+                let mut cuda_inputs = inputs
+                    .iter()
+                    .filter_map(|(n, b)| {
+                        gmem_mapping.get(n).map(|&idx| {
+                            (
+                                idx,
+                                (
+                                    copy_cuda_buffer(&b.clone().to_vec(dyn_vars), ctx.clone()),
+                                    false,
+                                ),
+                            )
+                        })
+                    })
+                    .collect::<FxHashMap<_, _>>();
+
+                for _ in 0..WARMUP_TRIALS {
+                    run_graph(
+                        graph,
+                        &mut cuda_inputs,
+                        kernels,
+                        dyn_vars,
+                        &compiled_kernels,
+                        &int_buffers,
+                        &int_buffer_map,
+                    );
+                }
+
+                let mut micros = vec![];
+                let mut outputs = vec![];
+                for _ in 0..TRIALS {
+                    let (o, m) = run_graph(
+                        graph,
+                        &mut cuda_inputs,
+                        kernels,
+                        dyn_vars,
+                        &compiled_kernels,
+                        &int_buffers,
+                        &int_buffer_map,
+                    );
+                    outputs = o;
+                    micros.push(m);
+                }
+                Some((
+                    micros.iter().sum::<u128>() / (TRIALS as u128).max(1),
+                    outputs.iter().map(copy_cuda_buffer_back).collect(),
+                ))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                None
+            }
+        }
+        GPUArch::OpenCL(_) => {
+            #[cfg(feature = "opencl")]
+            {
+                use opencl3::context::Context;
+                use opencl3::command_queue::CommandQueue;
+                use std::cell::RefCell;
+
+                thread_local! {
+                    static OCL_DEVICES: RefCell<Option<(Context, CommandQueue)>> = RefCell::new(None);
+                }
+
+                OCL_DEVICES.with(|cell| {
+                    let mut devices = cell.borrow_mut();
+                    if devices.is_none() {
+                        let platforms = get_platforms().unwrap();
+                        let platform = platforms.first().unwrap();
+                        let device_ids = platform.get_devices(CL_DEVICE_TYPE_GPU).unwrap();
+                        let device = OclDevice::new(*device_ids.first().unwrap());
+                        let context = Context::from_device(&device).unwrap();
+                        let queue = unsafe {
+                            CommandQueue::create_with_properties(
+                                &context,
+                                device.id(),
+                                CL_QUEUE_PROFILING_ENABLE,
+                                0,
+                            )
+                            .unwrap()
+                        };
+                        *devices = Some((context, queue));
+                    }
+                    let (context, queue) = devices.as_ref().unwrap();
+
+                    let compiled_kernels = compile_kernels(kernels, context);
+                    let (int_buffers, int_buffer_map) = assign_buffers(kernels);
+                    let mut ocl_inputs = inputs
+                        .iter()
+                        .filter_map(|(n, b)| {
+                            gmem_mapping.get(n).map(|&idx| {
+                                (
+                                    idx,
+                                    (
+                                        copy_opencl_buffer(&b.clone().to_vec(dyn_vars), context),
+                                        false,
+                                    ),
+                                )
+                            })
+                        })
+                        .collect::<FxHashMap<_, _>>();
+
+                    for _ in 0..WARMUP_TRIALS {
+                        run_graph(
+                            graph,
+                            &mut ocl_inputs,
+                            kernels,
+                            dyn_vars,
+                            &compiled_kernels,
+                            &int_buffers,
+                            &int_buffer_map,
+                            context,
+                            queue,
+                        );
+                    }
+
+                    let mut micros = vec![];
+                    let mut outputs = vec![];
+                    for _ in 0..TRIALS {
+                        let (o, m) = run_graph(
+                            graph,
+                            &mut ocl_inputs,
+                            kernels,
+                            dyn_vars,
+                            &compiled_kernels,
+                            &int_buffers,
+                            &int_buffer_map,
+                            context,
+                            queue,
+                        );
+                        outputs = o;
+                        micros.push(m);
+                    }
+                    Some((
+                        micros.iter().sum::<u128>() / (TRIALS as u128).max(1),
+                        outputs
+                            .iter()
+                            .map(|b| copy_opencl_buffer_back(b, queue))
+                            .collect(),
+                    ))
+                })
+            }
+            #[cfg(not(feature = "opencl"))]
+            {
+                None
+            }
+        }
     })
 }
 
@@ -1121,9 +1181,31 @@ pub fn copy_cuda_buffer_back(buf: &CudaSlice<f32>) -> Vec<f32> {
     buf.stream().memcpy_dtov(buf).unwrap()
 }
 
+#[cfg(feature = "opencl")]
+pub fn copy_opencl_buffer(v: &[f32], context: &Context) -> OclBuffer<f32> {
+    assert!(!v.is_empty(), "Can't copy empty slice to device");
+    unsafe {
+        OclBuffer::<f32>::create(
+            context,
+            CL_MEM_COPY_HOST_PTR | CL_MEM_READ_WRITE,
+            v.len(),
+            v.as_ptr() as *mut c_void,
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(feature = "opencl")]
+pub fn copy_opencl_buffer_back(buffer: &OclBuffer<f32>, queue: &CommandQueue) -> Vec<f32> {
+    let mut vec = vec![0.0; buffer.size().unwrap() / std::mem::size_of::<f32>()];
+    let event = unsafe { queue.enqueue_read_buffer(buffer, CL_TRUE, 0, &mut vec, &[]).unwrap() };
+    event.wait().unwrap();
+    vec
+}
+
 #[cfg(feature = "metal")]
 pub fn copy_metal_buffer(v: &Vec<f32>, device: &Device) -> Buffer {
-    assert!(v.len() > 0);
+    assert!(!v.is_empty());
     unsafe {
         let ptr = NonNull::new(v.as_ptr() as *mut c_void).unwrap();
         device
@@ -1161,20 +1243,22 @@ pub fn make_test_inputs(
             }
             // Walk down the loopins to find the max size
             let mut size = Expression::from(1);
-            let mut curr = graph
-                .neighbors_directed(node, Direction::Outgoing)
-                .next()
-                .unwrap();
-            loop {
-                if let GraphTerm::LoopIn { range, stride, .. } = graph.node_weight(curr).unwrap() {
-                    size = size.max(stride.substitute('z', *range));
-                    // size = size.max(stride.substitute('z', *range - 1) + 1); // why were we doing this?
-                    curr = graph
-                        .neighbors_directed(curr, Direction::Outgoing)
-                        .next()
-                        .unwrap();
-                } else {
-                    break;
+            if let Some(mut curr) = graph.neighbors_directed(node, Direction::Outgoing).next() {
+                loop {
+                    if let GraphTerm::LoopIn { range, stride, .. } =
+                        graph.node_weight(curr).unwrap()
+                    {
+                        size = size.max(stride.substitute('z', *range));
+                        if let Some(next_node) =
+                            graph.neighbors_directed(curr, Direction::Outgoing).next()
+                        {
+                            curr = next_node;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
             inputs.push((
@@ -1272,6 +1356,39 @@ mod tests {
                     op_name
                 );
             }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_metal_buffer_operations() {
+        use metal_rs::Device;
+
+        // Skip if Metal is not available
+        if Device::system_default().is_none() {
+            return;
+        }
+
+        let device = Device::system_default().unwrap();
+        let test_data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+
+        // Test buffer creation
+        let buffer = copy_metal_buffer(&test_data, &device);
+        assert_eq!(
+            buffer.length(),
+            (test_data.len() * std::mem::size_of::<f32>()) as u64
+        );
+
+        // Test buffer read back
+        let read_back = copy_metal_buffer_back(&buffer);
+        assert_eq!(read_back.len(), test_data.len());
+
+        // Verify data integrity
+        for (original, read) in test_data.iter().zip(&read_back) {
+            assert!(
+                (original - read).abs() < 1e-6,
+                "Buffer data should be preserved"
+            );
         }
     }
 

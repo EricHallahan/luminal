@@ -7,7 +7,7 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default = ["metal"]
+default = []
 cuda = ["dep:cudarc", "dep:luminal_cuda", "luminal_2/cuda"]
 metal = [
     "dep:objc2",
@@ -15,6 +15,7 @@ metal = [
     "dep:objc2-foundation",
     "luminal_2/metal",
 ]
+opencl = ["dep:opencl3", "luminal_2/opencl"]
 
 [dependencies]
 itertools = "0.14.0"
@@ -24,6 +25,7 @@ cudarc = { version = "0.16.6", features = [
     "f16",
     "cuda-12080",
 ], optional = true }
+opencl3 = { version = "0.12.0", features = ["CL_VERSION_1_2"], optional = true }
 luminal_nn = { path = "../../crates/luminal_nn" }
 luminal_2 = { path = "../../crates/luminal_2" }
 rand = "0.9.1"

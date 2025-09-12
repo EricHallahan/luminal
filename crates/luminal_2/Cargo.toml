@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["metal"]
+default = []
 cuda = ["dep:cudarc", "dep:luminal_cuda"]
 metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+opencl = ["dep:opencl3"]
 
 [dependencies]
 luminal = { path = "../../" }
@@ -18,6 +19,7 @@ cudarc = { version = "0.16.6", features = [
 #metal-rs = { version = "0.28.0", package = "metal", optional=true }
 objc2 = { version = "0.6.2", optional = true }
 objc2-metal = { version = "0.3.1", optional = true }
+opencl3 = { version = "0.12.0", features = ["CL_VERSION_1_2"], optional = true }
 itertools = "0.14.0"
 egglog = { git = "https://github.com/egraphs-good/egglog", rev="0be495630546acffbd545ba60feb9302281ce95c" }
 egglog-experimental = {git="https://github.com/egraphs-good/egglog-experimental"}

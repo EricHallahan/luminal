@@ -1,5 +1,5 @@
 #[cfg(feature = "metal")]
-use crate::{Buffer, Device, Function, GraphTerm};
+use crate::{Buffer, Device, Function};
 #[cfg(feature = "cuda")]
 use cudarc::{driver::*, nvrtc::CompileOptions};
 use itertools::Itertools;
@@ -22,11 +22,23 @@ use luminal::{
 };
 #[cfg(feature = "metal")]
 use objc2_metal::{MTLBuffer, MTLDevice};
+#[cfg(feature = "opencl")]
+use opencl3::{
+    command_queue::CommandQueue,
+    context::Context,
+    kernel::{ExecuteKernel, Kernel as OclKernel},
+    memory::{Buffer as OclBuffer, CL_MEM_READ_WRITE},
+    program::Program,
+};
 use rustc_hash::FxHashMap;
-use std::{ffi::c_void, ptr::NonNull};
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use std::{fs::File, io::Read};
 
-use crate::Kernel;
+#[cfg(feature = "metal")]
+use std::{ffi::c_void, ptr::NonNull};
+
+use crate::{GraphTerm, Kernel};
 
 pub fn assign_buffers(
     graph: &StableGraph<Kernel, (usize, usize)>,
@@ -159,8 +171,30 @@ pub fn compile_kernels(
     compiled
 }
 
+#[cfg(feature = "opencl")]
+pub fn compile_kernels(
+    kernels: &StableGraph<Kernel, (usize, usize)>,
+    context: &Context,
+) -> FxHashMap<String, OclKernel> {
+    let mut compiled = FxHashMap::default();
+    for kernel in kernels.node_weights() {
+        if !compiled.contains_key(&kernel.code)
+            && kernel.code != "Inputs"
+            && kernel.code != "Outputs"
+        {
+            let program =
+                Program::create_and_build_from_source(context, &kernel.code, "-cl-std=CL1.2")
+                    .unwrap();
+            let ocl_kernel = OclKernel::create(&program, "kernel_name").unwrap();
+            compiled.insert(kernel.code.clone(), ocl_kernel);
+        }
+    }
+    compiled
+}
+
 #[cfg(feature = "cuda")]
 pub fn run_graph(
+    _graph: &StableGraph<GraphTerm, ()>,
     inputs: &mut FxHashMap<usize, (CudaSlice<f32>, bool)>,
     kernels: &StableGraph<Kernel, (usize, usize)>,
     dyn_vars: &FxHashMap<char, usize>,
@@ -175,7 +209,11 @@ pub fn run_graph(
     // Allocate intermediate buffers
     let mut buffers = intermediate_buffers
         .iter()
-        .map(|e| unsafe { stream.alloc(e.exec(dyn_vars).unwrap()).unwrap() })
+        .map(|e| unsafe {
+            stream
+                .alloc(e.exec(dyn_vars).unwrap() * size_of::<f32>())
+                .unwrap()
+        })
         .collect_vec();
     let input_node = kernels
         .node_indices()
@@ -237,11 +275,11 @@ pub fn run_graph(
             if matched {
                 println!("DIFF {diff_name} MATCHED");
             }
-            let dest_buffer = &mut buffers[intermediate_buffer_map[&node][0]];
+            let dest_buffer: &mut CudaSlice<f32> = &mut buffers[intermediate_buffer_map[&node][0]];
             stream.memcpy_htod(&data, dest_buffer).unwrap();
         } else {
             let mut builder = stream.launch_builder(&compiled_kernels[&kernel.code]);
-            println!("Code to run: {}", kernel.code);
+            // println!("Code to run: {}", kernel.code);
 
             // set inputs
             for (input, input_index) in kernels
@@ -324,7 +362,7 @@ pub fn run_graph(
 
                 device
                     .newBufferWithLength_options(
-                        e.exec(dyn_vars).unwrap() * size_of::<f32>(),
+                        (e.exec(dyn_vars).unwrap() * size_of::<f32>()) as u64,
                         MTLResourceOptions::StorageModeShared,
                     )
                     .unwrap()
@@ -373,11 +411,11 @@ pub fn run_graph(
                     .next()
                     .unwrap();
                 let buffer = &buffers[intermediate_buffer_map[&input][input_index]];
-                let mut data = vec![0_f32; buffer.length() as usize / size_of::<f32>()];
+                let mut data = vec![0_f32; buffer.length() as usize / std::mem::size_of::<f32>()];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        buffer.contents().as_ptr() as *const _,
-                        &mut data,
+                        buffer.contents().as_ptr() as *const f32,
+                        data.as_mut_ptr(),
                         data.len(),
                     );
                 }
@@ -407,8 +445,8 @@ pub fn run_graph(
                 let dest_buffer = &mut buffers[intermediate_buffer_map[&node][0]];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        &data,
-                        dest_buffer.contents().as_ptr() as *mut _,
+                        data.as_ptr(),
+                        dest_buffer.contents().as_ptr() as *mut f32,
                         data.len(),
                     );
                 }
@@ -468,8 +506,6 @@ pub fn run_graph(
                 for (_, v) in dyn_vars.iter().sorted_by_key(|(k, _)| **k) {
                     let val: u64 = *v as u64;
                     let buf = unsafe {
-                        use std::{ffi::c_void, ptr::NonNull};
-
                         use objc2_metal::MTLResourceOptions;
 
                         device
@@ -521,13 +557,131 @@ pub fn run_graph(
     })
 }
 
+#[cfg(feature = "opencl")]
+pub fn run_graph(
+    _graph: &StableGraph<GraphTerm, ()>,
+    inputs: &mut FxHashMap<usize, (OclBuffer<f32>, bool)>,
+    kernels: &StableGraph<Kernel, (usize, usize)>,
+    dyn_vars: &FxHashMap<char, usize>,
+    compiled_kernels: &FxHashMap<String, OclKernel>,
+    intermediate_buffers: &Vec<Expression>,
+    intermediate_buffer_map: &FxHashMap<NodeIndex, Vec<usize>>,
+    context: &Context,
+    queue: &CommandQueue,
+) -> (Vec<OclBuffer<f32>>, u128) {
+    let start = std::time::Instant::now();
+
+    // Allocate intermediate buffers
+    let mut buffers = intermediate_buffers
+        .iter()
+        .map(|e| {
+            let size = e.exec(dyn_vars).unwrap();
+            unsafe {
+                OclBuffer::<f32>::create(context, CL_MEM_READ_WRITE, size, std::ptr::null_mut())
+            }
+            .unwrap()
+        })
+        .collect_vec();
+    let input_node = kernels
+        .node_indices()
+        .find(|n| kernels[*n].code == "Inputs")
+        .unwrap();
+
+    for node in toposort(kernels, None).unwrap() {
+        let kernel = &kernels[node];
+        if kernel.code == "Inputs" {
+            // Inputs provided
+        } else if kernel.code == "Outputs" {
+            queue.finish().unwrap();
+            let outputs = kernels
+                .edges_directed(node, Direction::Incoming)
+                .map(|e| {
+                    (
+                        e.weight().1,
+                        intermediate_buffer_map[&e.source()][e.weight().0],
+                    )
+                })
+                .sorted_by_key(|(_, b)| *b)
+                .rev()
+                .map(|(a, b)| (a, buffers.remove(b)))
+                .sorted_by_key(|(a, _)| *a)
+                .map(|(_, a)| a)
+                .collect_vec();
+            return (outputs, start.elapsed().as_micros());
+        } else if kernel.code.starts_with("Diff") {
+            // Not implemented for OpenCL yet, but this should be fine
+        } else {
+            let kernel_fn = &compiled_kernels[&kernel.code];
+            let mut exec_kernel = ExecuteKernel::new(kernel_fn);
+
+            // set inputs
+            for (input, input_index) in kernels
+                .edges_directed(node, Direction::Incoming)
+                .sorted_by_key(|n| n.weight().1)
+                .map(|n| (n.source(), n.weight().0))
+            {
+                let buffer: &OclBuffer<f32> = if input == input_node {
+                    &inputs[&input_index].0
+                } else {
+                    &buffers[intermediate_buffer_map[&input][input_index]]
+                };
+                unsafe { exec_kernel.set_arg(buffer) };
+            }
+
+            // set output
+            for o in 0..kernel.outputs.len() {
+                let buffer = &buffers[intermediate_buffer_map[&node][o]];
+                unsafe { exec_kernel.set_arg(buffer) };
+            }
+
+            // set dynamic dimensions
+            for (_, v) in dyn_vars.iter().sorted_by_key(|(k, _)| **k) {
+                let val: i32 = *v as i32;
+                unsafe { exec_kernel.set_arg(&val) };
+            }
+
+            // set shared mem
+            if kernel.code.contains("__local float* sm") {
+                unsafe {
+                    exec_kernel.set_arg_local_buffer(
+                        kernel.smem.exec(dyn_vars).unwrap() * std::mem::size_of::<f32>(),
+                    );
+                }
+            }
+
+            // Set dispatch
+            let grid = [
+                kernel.grid.0.exec(dyn_vars).unwrap(),
+                kernel.grid.1.exec(dyn_vars).unwrap(),
+                kernel.grid.2.exec(dyn_vars).unwrap(),
+            ];
+            let tb = [
+                kernel.threadblock.0.exec(dyn_vars).unwrap(),
+                kernel.threadblock.1.exec(dyn_vars).unwrap(),
+                kernel.threadblock.2.exec(dyn_vars).unwrap(),
+            ];
+            let global_work_size = [grid[0] * tb[0], grid[1] * tb[1], grid[2] * tb[2]];
+
+            unsafe {
+                exec_kernel
+                    .set_global_work_sizes(&global_work_size)
+                    .set_local_work_sizes(&tb)
+                    .enqueue_nd_range(queue)
+                    .unwrap();
+            }
+        }
+    }
+    panic!("No output kernel detected in graph!");
+}
+
 #[cfg(feature = "metal")]
 pub fn copy_metal_buffer(v: &Vec<f32>, device: &Device) -> Buffer {
+    use std::{ffi::c_void, ptr::NonNull};
     let buf = unsafe {
         device
             .newBufferWithBytes_length_options(
                 NonNull::new(v.as_ptr() as *mut c_void).unwrap(),
-                v.len() * std::mem::size_of::<f32>(),
+                (v.len() * std::mem::size_of::<f32>()) as u64,
                 objc2_metal::MTLResourceOptions::StorageModeShared,
             )
             .unwrap()
