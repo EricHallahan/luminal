@@ -40,11 +40,11 @@ pub enum GPUArch {
 
 impl GPUArch {
     fn pointer_qualifier(&self, var: usize) -> &'static str {
-         match self {
+        match self {
             Self::Metal(m) | Self::OpenCL(m) => m.get(&var).copied().unwrap_or(""),
             _ => "",
-         }
-     }
+        }
+    }
 
     fn add_pointer_qualifier(&mut self, var: usize, buf_type: &'static str) {
         if let Self::Metal(m) | Self::OpenCL(m) = self {

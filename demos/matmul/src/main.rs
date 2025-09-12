@@ -50,7 +50,7 @@ fn main() {
         let arch = GPUArch::CUDA;
         #[cfg(feature = "opencl")]
         let arch = GPUArch::OpenCL(HashMap::default());
-        
+
         #[allow(non_snake_case)]
         let (M, K, N, J) = (512, 512, 512, 512);
         let mut cx = Graph::new();
@@ -143,13 +143,27 @@ fn main() {
             let device = Device::new(*device_ids.first().unwrap());
             println!("{}", device.name().unwrap());
             let context = Context::from_device(&device).unwrap();
-            let queue = unsafe { CommandQueue::create_with_properties(&context, device.id(), CL_QUEUE_PROFILING_ENABLE, 0).unwrap() };
+            let queue = unsafe {
+                CommandQueue::create_with_properties(
+                    &context,
+                    device.id(),
+                    CL_QUEUE_PROFILING_ENABLE,
+                    0,
+                )
+                .unwrap()
+            };
             (context, queue)
         };
 
         let compiled = {
-            #[cfg(any(feature = "metal", feature = "cuda"))] { compile_kernels(&kernels) }
-            #[cfg(feature = "opencl")] { compile_kernels(&kernels, &context) }
+            #[cfg(any(feature = "metal", feature = "cuda"))]
+            {
+                compile_kernels(&kernels)
+            }
+            #[cfg(feature = "opencl")]
+            {
+                compile_kernels(&kernels, &context)
+            }
         };
 
         let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
@@ -267,15 +281,19 @@ fn main() {
                     &int_buffers,
                     &int_buffer_map,
                     &context,
-                    &queue
+                    &queue,
                 )
             }
         };
         println!("{:?}", {
-            #[cfg(any(feature="metal", feature="cuda"))]
-            { &copy_buffer_back(&outputs[0])[..10] }
-            #[cfg(feature="opencl")]
-            { &copy_buffer_back(&outputs[0], &queue)[..10] }
+            #[cfg(any(feature = "metal", feature = "cuda"))]
+            {
+                &copy_buffer_back(&outputs[0])[..10]
+            }
+            #[cfg(feature = "opencl")]
+            {
+                &copy_buffer_back(&outputs[0], &queue)[..10]
+            }
         });
     });
 }
@@ -323,14 +341,24 @@ pub fn copy_buffer_back(v: &Buffer) -> Vec<f32> {
 #[cfg(feature = "opencl")]
 pub fn copy_buffer(v: &[f32], (context, _queue): (&Context, &CommandQueue)) -> Buffer<f32> {
     unsafe {
-        Buffer::<f32>::create(context, CL_MEM_COPY_HOST_PTR | CL_MEM_READ_WRITE, v.len(), v.as_ptr() as *mut c_void).unwrap()
+        Buffer::<f32>::create(
+            context,
+            CL_MEM_COPY_HOST_PTR | CL_MEM_READ_WRITE,
+            v.len(),
+            v.as_ptr() as *mut c_void,
+        )
+        .unwrap()
     }
 }
 
 #[cfg(feature = "opencl")]
 pub fn copy_buffer_back(buffer: &Buffer<f32>, queue: &CommandQueue) -> Vec<f32> {
     let mut vec = vec![0.0; buffer.size().unwrap() / std::mem::size_of::<f32>()];
-    let event = unsafe { queue.enqueue_read_buffer(buffer, CL_TRUE, 0, &mut vec, &[]).unwrap() };
+    let event = unsafe {
+        queue
+            .enqueue_read_buffer(buffer, CL_TRUE, 0, &mut vec, &[])
+            .unwrap()
+    };
     event.wait().unwrap();
     vec
 }

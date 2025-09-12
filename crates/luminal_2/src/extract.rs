@@ -19,10 +19,10 @@ use luminal::shape::{Expression, Term};
 use objc2_metal::{MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
 #[cfg(feature = "opencl")]
 use opencl3::{
-    command_queue::{CommandQueue, CL_QUEUE_PROFILING_ENABLE},
+    command_queue::{CL_QUEUE_PROFILING_ENABLE, CommandQueue},
     context::Context,
-    device::{Device as OclDevice, CL_DEVICE_TYPE_GPU},
-    memory::{Buffer as OclBuffer, ClMem, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_WRITE},
+    device::{CL_DEVICE_TYPE_GPU, Device as OclDevice},
+    memory::{Buffer as OclBuffer, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_WRITE, ClMem},
     platform::get_platforms,
     types::CL_TRUE,
 };
@@ -389,7 +389,9 @@ pub fn search(
                 } else {
                     seen.insert(k);
                 }
-                if let Some((us, outs)) = cost(&graph, &kernels, &inputs, &gmem_mapping, dyn_vars, &arch) {
+                if let Some((us, outs)) =
+                    cost(&graph, &kernels, &inputs, &gmem_mapping, dyn_vars, &arch)
+                {
                     valid_graphs += 1;
                     if let Some((progress, logs, title, _)) = &ui_functions {
                         progress(((n as f32 / total_trajectories as f32) * 100.0) as u16);
@@ -457,7 +459,9 @@ pub fn search(
                 } else {
                     seen.insert(k.clone());
                 }
-                if let Some((us, outs)) = cost(&graph, &kernels, &inputs, &gmem_mapping, dyn_vars) {
+                if let Some((us, outs)) =
+                    cost(&graph, &kernels, &inputs, &gmem_mapping, dyn_vars, &arch)
+                {
                     valid_graphs += 1;
                     if let Some((progress, logs, title, _)) = &ui_functions {
                         progress(((n as f32 / total_trajectories as f32) * 100.0) as u16);
@@ -852,54 +856,63 @@ fn cost<'a>(
     dyn_vars: &FxHashMap<char, usize>,
     arch: &GPUArch,
 ) -> Option<(Cost, Vec<Vec<f32>>)> {
-    with_autoreleasepool(|| {
-        // Get buffer info
-        let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
-        let compiled_kernels = compile_kernels(&kernels);
-        #[cfg(feature = "metal")]
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        #[cfg(feature = "cuda")]
-        let ctx = CudaContext::new(0).unwrap(); // will need to expand beyond single host
-        // Copy input buffers over
-        let mut inputs = inputs
-            .into_iter()
-            .filter(|(n, _)| gmem_mapping.contains_key(n))
-            .map(|(n, b)| {
-                (
-                    gmem_mapping[n],
-                    (
-                        #[cfg(feature = "metal")]
-                        match b {
-                            InitData::Data(d) => copy_metal_buffer(d, &device),
-                            InitData::Expr(e) => {
-                                copy_metal_buffer(&vec![e.exec(dyn_vars).unwrap() as f32], &device)
-                            }
-                        },
-                        #[cfg(feature = "cuda")]
-                        match b {
-                            InitData::Data(d) => copy_cuda_buffer(d, &device),
-                            InitData::Expr(e) => copy_cuda_buffer(
-                                &vec![e.exec(dyn_vars).unwrap() as f32],
-                                ctx.clone(),
-                            ),
-                        },
-                        false,
-                    ),
-                )
-            })
-            .collect::<FxHashMap<_, _>>();
-        // Warm up resources (buffer allocation, kernel compiler, etc.)
-        for _ in 0..WARMUP_TRIALS {
+    with_autoreleasepool(|| match arch {
+        GPUArch::Metal(_) => {
             #[cfg(feature = "metal")]
-            run_graph(
-                &graph,
-                &mut inputs,
-                &kernels,
-                dyn_vars,
-                &compiled_kernels,
-                &int_buffers,
-                &int_buffer_map,
-            );
+            {
+                let device = MTLCreateSystemDefaultDevice().unwrap();
+                let compiled_kernels = compile_kernels(kernels);
+                let (int_buffers, int_buffer_map) = assign_buffers(kernels);
+                let mut metal_inputs = inputs
+                    .iter()
+                    .filter_map(|(n, b)| {
+                        gmem_mapping.get(n).map(|&idx| {
+                            (
+                                idx,
+                                (copy_metal_buffer(&b.to_vec(dyn_vars), &device), false),
+                            )
+                        })
+                    })
+                    .collect::<FxHashMap<_, _>>();
+
+                for _ in 0..WARMUP_TRIALS {
+                    run_graph(
+                        graph,
+                        &mut metal_inputs,
+                        kernels,
+                        dyn_vars,
+                        &compiled_kernels,
+                        &int_buffers,
+                        &int_buffer_map,
+                    );
+                }
+
+                let mut micros = vec![];
+                let mut outputs = vec![];
+                for _ in 0..TRIALS {
+                    let (o, m) = run_graph(
+                        graph,
+                        &mut metal_inputs,
+                        kernels,
+                        dyn_vars,
+                        &compiled_kernels,
+                        &int_buffers,
+                        &int_buffer_map,
+                    );
+                    outputs = o;
+                    micros.push(m);
+                }
+                Some((
+                    micros.iter().sum::<u128>() / (TRIALS as u128).max(1),
+                    outputs.iter().map(copy_metal_buffer_back).collect(),
+                ))
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                None
+            }
+        }
+        GPUArch::CUDA => {
             #[cfg(feature = "cuda")]
             {
                 let ctx = CudaContext::new(0).unwrap();
@@ -960,8 +973,8 @@ fn cost<'a>(
         GPUArch::OpenCL(_) => {
             #[cfg(feature = "opencl")]
             {
-                use opencl3::context::Context;
                 use opencl3::command_queue::CommandQueue;
+                use opencl3::context::Context;
                 use std::cell::RefCell;
 
                 thread_local! {
@@ -1088,7 +1101,11 @@ pub fn copy_opencl_buffer(v: &[f32], context: &Context) -> OclBuffer<f32> {
 #[cfg(feature = "opencl")]
 pub fn copy_opencl_buffer_back(buffer: &OclBuffer<f32>, queue: &CommandQueue) -> Vec<f32> {
     let mut vec = vec![0.0; buffer.size().unwrap() / std::mem::size_of::<f32>()];
-    let event = unsafe { queue.enqueue_read_buffer(buffer, CL_TRUE, 0, &mut vec, &[]).unwrap() };
+    let event = unsafe {
+        queue
+            .enqueue_read_buffer(buffer, CL_TRUE, 0, &mut vec, &[])
+            .unwrap()
+    };
     event.wait().unwrap();
     vec
 }
@@ -1109,7 +1126,7 @@ pub fn copy_metal_buffer(v: &Vec<f32>, device: &Device) -> Buffer {
 }
 #[cfg(feature = "metal")]
 pub fn copy_metal_buffer_back(v: &Buffer) -> Vec<f32> {
-    let mut data = vec![0f32; v.length() as usize / size_of::<f32>()];
+    let mut data = vec![0f32; v.length() as usize / std::mem::size_of::<f32>()];
     let ptr = v.contents().as_ptr() as *mut f32;
     for (i, d) in data.iter_mut().enumerate() {
         *d = unsafe { *ptr.add(i) };
