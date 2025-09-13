@@ -190,6 +190,9 @@ pub fn codegen(
             .collect_vec();
         // Make sure there are no dynamic dimensions in the threadblock TODO: why is this not allowed?
         if threadblock.iter().any(|i| i.to_usize().is_none()) {
+            if option_env!("PRINT_REJECT").is_some() {
+                println!("dyn in threadblock");
+            }
             return None;
         }
         let kernel_lines = kernel.into_iter().map(|s| format!("\t{s}")).join("\n");
@@ -287,15 +290,27 @@ kernel void kernel_name(
             .unwrap()
             > MAX_THREADBLOCK_SIZE
         {
+            if option_env!("PRINT_REJECT").is_some() {
+                println!("threadblock too large: {threadblock:?}");
+            }
             return None;
         }
         if grid[0].exec(dyn_vars).unwrap() > MAX_GRID_X {
+            if option_env!("PRINT_REJECT").is_some() {
+                println!("grid x too large: {}", grid[0]);
+            }
             return None;
         }
         if grid[1].exec(dyn_vars).unwrap() > MAX_GRID_YZ {
+            if option_env!("PRINT_REJECT").is_some() {
+                println!("grid y too large: {}", grid[1]);
+            }
             return None;
         }
         if grid[2].exec(dyn_vars).unwrap() > MAX_GRID_YZ {
+            if option_env!("PRINT_REJECT").is_some() {
+                println!("grid z too large: {}", grid[2]);
+            }
             return None;
         }
         *kernel_meta_graph.node_weight_mut(node).unwrap() = Kernel {
@@ -514,8 +529,8 @@ fn make_kernel(
                         // Handle the case where the dest is not the real loop output
                         let size = stride.substitute('z', range).max(1);
                         if current_loop_level < THREADBLOCK_DIMS + GRID_DIMS {
-                            if std::env::var("PRINT_REJECT").is_ok() {
-                                println!("too low?");
+                            if option_env!("PRINT_REJECT").is_some() {
+                                println!("acc too low");
                             }
                             return None;
                         }
@@ -771,6 +786,9 @@ fn make_kernel(
                 }
             }
             GraphTerm::LoopOut { .. } => {
+                if option_env!("PRINT_REJECT").is_some() {
+                    println!("seen loopout");
+                }
                 return None; // TODO: why do we ever see this? should be able to panic here.
                 // panic!("found loopout range: {range} stride: {stride}")
             }

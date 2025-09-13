@@ -82,6 +82,7 @@
 	(Mul)
 	(Max)
 )
+(sort EVec (Vec Expression))
 (datatype IR
 	; General kernel stuff
    	(GMEM String)
@@ -97,7 +98,7 @@
    	(TileLoop IR String) ; Tile a loop, identified by it's string
     (UnpadLoop IR String) ; Remove a padding loop, identified by it's string
     (MergeLoops IR String String) ; Merge loops, identified by their strings
-    (Fused IR) ; Says that we have previously fused a loopout -> loopin here
+    (Fused IR EVec) ; Says that we have previously fused loopout -> loopins here
 
    	; tensor core stuff
    	(TCMatmul IR IR Expression Expression Expression Expression Expression Expression) ; input A, input B, A k stride, B k stride, A inner stride, B inner stride, C inner stride, number of K tile loops
@@ -218,7 +219,7 @@
 ; something -> fused
 (rule
 	(
-		(= curr (Fused x))
+		(= curr (Fused x y))
 		(= xll (loop_level x))
 	)
 	((set (loop_level curr) (- xll 1)))
@@ -248,67 +249,16 @@
 ; ---------- RULES ----------
 
 ; Loop Fusion
+(ruleset fusion)
 (rewrite
-	(LoopIn (LoopOut (Binary ?bin ?a ?b) (Loop ?loopA ?range) ?st) (Loop ?loopB ?range) ?st)
-	(Fused (Binary ?bin ?a ?b))
-	:ruleset ir
+	(LoopIn (LoopOut ?a (Loop ?loopA ?range) ?st) (Loop ?loopB ?range) ?st)
+	(Fused ?a (vec-of ?range))
+	:ruleset fusion
 )
 (rewrite
-	(LoopIn (LoopIn
-		(LoopOut (LoopOut (Binary ?bin ?a ?b) (Loop ?loopA1 ?range1) ?st1) (Loop ?loopA2 ?range2) ?st2)
-	(Loop ?loopB2 ?range2) ?st2) (Loop ?loopB1 ?range1) ?st1)
-	(Fused (Binary ?bin ?a ?b))
-	 :ruleset ir
-)
-(rewrite
-	(LoopIn
-		(LoopIn
-			(LoopIn
-				(LoopOut
-					(LoopOut
-						(LoopOut
-							(Binary ?bin ?a ?b)
-							(Loop ?loopA1 ?range1)
-							?st1
-						)
-						(Loop ?loopA2 ?range2)
-						?st2
-					)
-					(Loop ?loopA3 ?range3)
-					?st3
-				)
-				(Loop ?loopB3 ?range3)
-				?st3
-			)
-			(Loop ?loopB2 ?range2)
-			?st2
-		)
-		(Loop ?loopB1 ?range1)
-		?st1
-	)
-	(Fused (Binary ?bin ?a ?b))
-	:ruleset ir
-)
-(rewrite
-	(LoopIn (LoopOut (Unary ?un ?a) (Loop ?loopA ?range) ?st) (Loop ?loopB ?range) ?st)
-	(Fused (Unary ?un ?a))
-	:ruleset ir
-)
-(rewrite
-	(LoopIn (LoopIn
-		(LoopOut (LoopOut (Unary ?un ?a) (Loop ?loopA1 ?range1) ?st1) (Loop ?loopA2 ?range2) ?st2)
-	(Loop ?loopB2 ?range2) ?st2) (Loop ?loopB1 ?range1) ?st1)
-	(Fused (Unary ?un ?a))
-	:ruleset ir
-)
-(rewrite
-	(LoopIn (LoopIn (LoopIn
-		(LoopOut (LoopOut (LoopOut
-			(Unary ?un ?a)
-		(Loop ?loopA1 ?range1) ?st1) (Loop ?loopA2 ?range2) ?st2) (Loop ?loopA3 ?range3) ?st3)
-	(Loop ?loopB3 ?range3) ?st3) (Loop ?loopB2 ?range2) ?st2) (Loop ?loopB1 ?range1) ?st1)
-	(Fused (Unary ?un ?a))
-	:ruleset ir
+	(LoopIn (Fused (LoopOut ?a (Loop ?loopA ?range) ?st) ?prev_fused) (Loop ?loopB ?range) ?st)
+	(Fused ?a (vec-push ?prev_fused ?range))
+	:ruleset fusion
 )
 
 ; Tiling
@@ -371,7 +321,7 @@
 		(Loop ?o (MNum ?rangeO)) ?stO
 	)
 	(LoopOut (MergeLoops ?x ?o ?i)
-		(Loop (+ ?o (+ "merge" ?i)) (MNum (* ?rangeO ?rangeI)))
+		(Loop (+ ?o ?i) (MNum (* ?rangeO ?rangeI)))
 		(MAdd (MReplace ?stO (MVar "z") (MDiv (MVar "z") (MNum ?rangeI))) (MReplace ?stI (MVar "z") (MMod (MVar "z") (MNum ?rangeI))))
 	)
 	:when ((set-not-contains (MAccumSet) ?stI) (set-not-contains (MAccumSet) ?stO))
@@ -390,10 +340,10 @@
 	)
 	(LoopIn
 		?x
-		(Loop (+ ?o (+ "merge" ?i)) (MMul ?rangeO ?rangeI))
+		(Loop (+ ?o ?i) (MMul ?rangeO ?rangeI))
 		(MAdd (MReplace ?stO (MVar "z") (MDiv (MVar "z") ?rangeI)) (MReplace ?stI (MVar "z") (MMod (MVar "z") ?rangeI)))
 	)
-	 :ruleset ir-prop
+	:ruleset ir-prop
 )
 ; propogation
 (rewrite
@@ -464,7 +414,7 @@
 					(Fused (Binary (Mul)
 						(TiledMatmulInputB ?b ?n ?k_loops)
 						(TiledMatmulInputA ?a ?k ?k_loops)
-					))
+					) ?fusedloops)
 					; accumulator
 					(LoopIn ; k
 						(LoopIn ; n
@@ -641,15 +591,14 @@
 (run-schedule
 	(saturate expr)
 	(let-scheduler bo (back-off))
-	(saturate ir-prop)
 	(repeat 1
 		(run-with bo ir)
 		(saturate ir-prop)
 		(saturate expr)
+		(saturate fusion)
 	)
 	(saturate ir-prop)
 	(saturate tc)
-	(saturate ir-prop)
 	(saturate loop-unname) ; TODO: we need to get rid of loop names entirely
 )
 
