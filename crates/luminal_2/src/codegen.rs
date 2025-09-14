@@ -1365,7 +1365,7 @@ fn reassign_disjoint_kernels(
         }
     }
     // Build i -> nodes and find current max index
-    let next_kernel_idx = *g.node_weights().flat_map(|(_, _, k)| k).max().unwrap_or(&0);
+    let mut next_kernel_idx = *g.node_weights().flat_map(|(_, _, k)| k).max().unwrap_or(&0);
     let idx_to_nodes = g
         .node_indices()
         .flat_map(|n| g[n].2.iter().copied().map(move |i| (i, n)))
@@ -1403,6 +1403,7 @@ fn reassign_disjoint_kernels(
             .skip(1)
             .enumerate()
         {
+            next_kernel_idx += 1;
             for n in comp {
                 let ws = &mut g.node_weight_mut(n).unwrap().2;
                 if ws.remove(&i) {
@@ -1412,7 +1413,7 @@ fn reassign_disjoint_kernels(
         }
     }
 
-    // re-add kernel ids
+    // re-add gmem kernel ids
     for i in g.node_indices().collect_vec() {
         if matches!(g[i].0, GraphTerm::GMEM { .. }) {
             g.node_weight_mut(i).unwrap().2 = g

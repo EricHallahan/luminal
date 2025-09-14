@@ -248,7 +248,7 @@ pub fn render_egglog(
                     panic!("LoopIn expects 1 child");
                 };
                 format!(
-                    "(LoopIn {src} (Loop \"{marker}\" {}) {})",
+                    "(LoopIn {src} {} {})",
                     range.to_egglog(),
                     stride.to_egglog()
                 )
@@ -262,7 +262,7 @@ pub fn render_egglog(
                     panic!("LoopOut expects 1 child");
                 };
                 format!(
-                    "(LoopOut {body} (Loop \"{marker}\" {}) {})",
+                    "(LoopOut {body} {} {})",
                     range.to_egglog(),
                     stride.to_egglog()
                 )
@@ -378,12 +378,7 @@ pub fn render_egglog_inline(
             } => {
                 let src = &children[0];
                 format!(
-                    "(LoopIn {src} (Loop \"{}\" {}) {})",
-                    if no_loop_markers {
-                        "".to_string()
-                    } else {
-                        marker.to_string()
-                    },
+                    "(LoopIn {src} {} {})",
                     range.to_egglog(),
                     stride.to_egglog()
                 )
@@ -395,12 +390,7 @@ pub fn render_egglog_inline(
             } => {
                 let body = &children[0];
                 format!(
-                    "(LoopOut {body} (Loop \"{}\" {}) {})",
-                    if no_loop_markers {
-                        "".to_string()
-                    } else {
-                        marker.to_string()
-                    },
+                    "(LoopOut {body} {} {})",
                     range.to_egglog(),
                     stride.to_egglog()
                 )
@@ -770,10 +760,6 @@ pub fn generate_proof(
 		(run ir-generic)
 	)
 )
-
-(ruleset loop-blank)
-(rewrite (Loop ?s ?r) (Loop \"\" ?r) :ruleset loop-blank)
-(run-schedule (run loop-blank))
     ",
         )
         .unwrap();
