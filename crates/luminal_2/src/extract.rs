@@ -42,7 +42,7 @@ use {
 
 const WARMUP_TRIALS: usize = 0;
 const TRIALS: usize = 1;
-const MAX_SEARCHED_GRAPHS: usize = 10_000;
+const MAX_SEARCHED_GRAPHS: usize = 1_000;
 const MAX_CYCLES: usize = 1;
 const INVALID_IR: &[&str] = &[
     "SwapLoops",
@@ -671,21 +671,9 @@ pub fn extraction_to_graph(
                 } else if let Some(&n) = prev_placed.get(node_choice) {
                     n
                 } else {
-                    let marker = loop_level_map
-                        .get(&node_choice)
-                        .map(|i| i.to_string())
-                        .unwrap_or_default();
                     let term = match op {
-                        "LoopIn" => GraphTerm::LoopIn {
-                            range,
-                            stride,
-                            marker,
-                        },
-                        "LoopOut" => GraphTerm::LoopOut {
-                            range,
-                            stride,
-                            marker,
-                        },
+                        "LoopIn" => GraphTerm::LoopIn { range, stride },
+                        "LoopOut" => GraphTerm::LoopOut { range, stride },
                         _ => unreachable!(),
                     };
                     let r = g.add_node(term);

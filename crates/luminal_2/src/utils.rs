@@ -47,7 +47,6 @@ pub fn loop_in(
     node: NodeIndex,
     range: impl Into<Expression>,
     stride: impl Into<Expression>,
-    marker: impl ToString,
     graph: &mut StableGraph<GraphTerm, (), Directed>,
 ) -> NodeIndex {
     unary(
@@ -55,7 +54,6 @@ pub fn loop_in(
         GraphTerm::LoopIn {
             range: range.into(),
             stride: stride.into(),
-            marker: marker.to_string(),
         },
         graph,
     )
@@ -65,7 +63,6 @@ pub fn loop_out(
     node: NodeIndex,
     range: impl Into<Expression>,
     stride: impl Into<Expression>,
-    marker: impl ToString,
     graph: &mut StableGraph<GraphTerm, (), Directed>,
 ) -> NodeIndex {
     unary(
@@ -73,7 +70,6 @@ pub fn loop_out(
         GraphTerm::LoopOut {
             range: range.into(),
             stride: stride.into(),
-            marker: marker.to_string(),
         },
         graph,
     )
@@ -85,7 +81,7 @@ pub fn pad_in(
     levels: usize,
 ) -> NodeIndex {
     for i in 0..levels {
-        node = loop_in(node, 1, 0, "pad".to_string(), graph);
+        node = loop_in(node, 1, 0, graph);
     }
     node
 }
@@ -96,7 +92,7 @@ pub fn pad_out(
     levels: usize,
 ) -> NodeIndex {
     for i in (0..levels).rev() {
-        node = loop_out(node, 1, 0, "pad".to_string(), graph);
+        node = loop_out(node, 1, 0, graph);
     }
     node
 }
@@ -238,11 +234,7 @@ pub fn render_egglog(
             }
             GraphTerm::SMEM => "(SMEM)".into(),
 
-            GraphTerm::LoopIn {
-                range,
-                stride,
-                marker,
-            } => {
+            GraphTerm::LoopIn { range, stride } => {
                 let [ref src] = operand(n, &names, &graph)[..] else {
                     panic!("LoopIn expects 1 child");
                 };
@@ -252,11 +244,7 @@ pub fn render_egglog(
                     stride.to_egglog()
                 )
             }
-            GraphTerm::LoopOut {
-                range,
-                stride,
-                marker,
-            } => {
+            GraphTerm::LoopOut { range, stride } => {
                 let [ref body] = operand(n, &names, &graph)[..] else {
                     panic!("LoopOut expects 1 child");
                 };
@@ -370,11 +358,7 @@ pub fn render_egglog_inline(
         let expr = match &graph[n] {
             GraphTerm::GMEM { label } => format!("(GMEM \"{label}\")"),
             GraphTerm::SMEM => "(SMEM)".into(),
-            GraphTerm::LoopIn {
-                range,
-                stride,
-                marker,
-            } => {
+            GraphTerm::LoopIn { range, stride } => {
                 let src = &children[0];
                 format!(
                     "(LoopIn {src} {} {})",
@@ -382,11 +366,7 @@ pub fn render_egglog_inline(
                     stride.to_egglog()
                 )
             }
-            GraphTerm::LoopOut {
-                range,
-                stride,
-                marker,
-            } => {
+            GraphTerm::LoopOut { range, stride } => {
                 let body = &children[0];
                 format!(
                     "(LoopOut {body} {} {})",

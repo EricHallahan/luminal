@@ -1016,21 +1016,13 @@ impl TermToString for GraphTerm {
                 Color32::from_hex("#bf1919").unwrap(),
                 NodeShape::Circle,
             ),
-            GraphTerm::LoopIn {
-                range,
-                stride,
-                marker,
-            } => (
-                format!("LoopIn ({range}; {stride}; ({marker}))"),
+            GraphTerm::LoopIn { range, stride } => (
+                format!("LoopIn ({range}; {stride})"),
                 Color32::from_hex("#40b2e9").unwrap(),
                 NodeShape::InvertedTriangle,
             ),
-            GraphTerm::LoopOut {
-                range,
-                stride,
-                marker,
-            } => (
-                format!("LoopOut ({range}; {stride}; ({marker}))"),
+            GraphTerm::LoopOut { range, stride } => (
+                format!("LoopOut ({range}; {stride})"),
                 Color32::from_hex("#4340e9").unwrap(),
                 NodeShape::Triangle,
             ),

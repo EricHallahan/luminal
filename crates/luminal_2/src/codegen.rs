@@ -20,7 +20,7 @@ use std::{
 
 use crate::{
     GMEMBuffer, GPUArch, GraphTerm, Kernel,
-    debug::{display_graph, display_graph2, display_multiple_graphs},
+    debug::{display_graph, display_graph2},
     translate::{MetaGraph, SubGraph},
     utils::validate_graph,
 };
@@ -1154,8 +1154,6 @@ pub fn split_kernels(
         *ks = ks.drain().map(|k| remap[&k]).collect();
     }
 
-    let before = marked_graph.clone();
-
     // Add kernel barriers
     for edge in marked_graph.edge_indices().collect_vec() {
         let (mut src, mut dest) = marked_graph.edge_endpoints(edge).unwrap();
@@ -1175,7 +1173,6 @@ pub fn split_kernels(
                     GraphTerm::LoopOut {
                         range: dest_level[i],
                         stride,
-                        marker: "".to_string(),
                     },
                     dest_level[..i].to_vec(),
                     src_kernel.clone(),
@@ -1186,7 +1183,6 @@ pub fn split_kernels(
                     GraphTerm::LoopIn {
                         range: dest_level[i],
                         stride,
-                        marker: "".to_string(),
                     },
                     dest_level[..i].to_vec(),
                     dest_kernel.clone(),
