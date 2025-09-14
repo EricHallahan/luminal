@@ -165,7 +165,6 @@ pub fn build_search_space(
     let (rendered, root) = render_egglog(graph, "t");
     if option_env!("PRINT_EGGLOG").is_some() {
         println!("{rendered}");
-        // println!("{}", render_egglog(graph, "a").0);
     }
     let code = include_str!("code.lisp");
 

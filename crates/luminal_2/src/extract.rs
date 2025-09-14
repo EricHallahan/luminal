@@ -4,7 +4,6 @@ use std::usize;
 
 use crate::Kernel;
 use crate::debug::display_graph;
-use crate::egraph_debugger::display_egraph;
 use crate::run::{assign_buffers, compile_kernels, run_graph};
 use crate::translate::InitData;
 use crate::utils::{build_search_space, generate_proof, print_kernels};
@@ -43,7 +42,7 @@ use {
 
 const WARMUP_TRIALS: usize = 0;
 const TRIALS: usize = 1;
-const MAX_SEARCHED_GRAPHS: usize = 1_000;
+const MAX_SEARCHED_GRAPHS: usize = 10_000;
 const MAX_CYCLES: usize = 1;
 const INVALID_IR: &[&str] = &[
     "SwapLoops",
@@ -252,7 +251,7 @@ fn extract_trajectories<'a>(
                     .cartesian_product(
                         trajectory_cache[child]
                             .iter()
-                            .take(MAX_SEARCHED_GRAPHS / n_enode_traj),
+                            .take((MAX_SEARCHED_GRAPHS / n_enode_traj).max(1)),
                     )
                     .map(|(p, n)| {
                         if egraph.nodes[enode].op != "Fused" {
@@ -301,7 +300,6 @@ pub fn search(
         &mut FxHashMap::default(),
         1,
     );
-    println!("traj: {}", trajectories.len());
     // build loop level -> enode mapping
     let mut loop_level_values = FxHashMap::default();
     for (id, _) in &egraph.class_data {
@@ -367,10 +365,7 @@ pub fn search(
     {
         // crate::egraph_debugger::display_egraph_with_path(&egraph, &trajectory);
         // Build termdag
-        let Some(graph) = extraction_to_graph(&egraph, &trajectory, &loop_level_map) else {
-            println!("skip");
-            continue;
-        };
+        let graph = extraction_to_graph(&egraph, &trajectory, &loop_level_map);
         prev_graphs.push(graph.clone());
         prev_traj.push(trajectory.clone());
 
@@ -410,7 +405,7 @@ pub fn search(
                         } else {
                             for (a, b) in ref_outputs.iter().zip(&outs) {
                                 for (x, y) in a.iter().zip(b) {
-                                    if (x - y).abs() >= 0.1 {
+                                    if (x - y).abs() >= 1e-4 {
                                         if option_env!("DEBUG").is_some() {
                                             println!(
                                                 "REF: {:?}",
@@ -462,14 +457,6 @@ pub fn search(
                 } else {
                     seen.insert(k.clone());
                 }
-                // if kernels.node_count() as u128 >= best_time {
-                //     if let Some((progress, logs, title, _)) = &ui_functions {
-                //         progress(((n as f32 / total_trajectories as f32) * 100.0) as u16);
-                //         logs(k);
-                //         title(format!("Graph {n} best {}", best_time - 2));
-                //     }
-                //     continue;
-                // }
                 if let Some((us, outs)) = cost(&graph, &kernels, &inputs, &gmem_mapping, dyn_vars) {
                     valid_graphs += 1;
                     if let Some((progress, logs, title, _)) = &ui_functions {
@@ -546,7 +533,7 @@ pub fn extraction_to_graph(
     egraph: &EGraph,
     trajectory: &[&NodeId],
     loop_level_map: &FxHashMap<&NodeId, i32>,
-) -> Option<StableGraph<GraphTerm, (), Directed>> {
+) -> StableGraph<GraphTerm, (), Directed> {
     let mut g = StableGraph::new();
 
     fn build_expression<'a>(
@@ -636,12 +623,12 @@ pub fn extraction_to_graph(
         loop_level_map: &FxHashMap<&'a NodeId, i32>,
         prev_placed: &'b mut FxHashMap<&'a NodeId, NodeIndex>,
         no_place: bool,
-    ) -> Option<NodeIndex> {
+    ) -> NodeIndex {
         let node_choice = trajectory[*current];
         let enode = &egraph.nodes[node_choice];
         let op = enode.op.as_str();
 
-        Some(match op {
+        match op {
             // Leaf-ish memory node
             "GMEM" => {
                 *current += 1;
@@ -662,7 +649,6 @@ pub fn extraction_to_graph(
             "LoopIn" | "LoopOut" => {
                 *current += 1;
                 let already = prev_placed.contains_key(node_choice);
-
                 // child expr
                 let child_one = build_ir(
                     egraph,
@@ -672,9 +658,9 @@ pub fn extraction_to_graph(
                     loop_level_map,
                     prev_placed,
                     already || no_place,
-                )?;
+                );
 
-                // range, stride (math)
+                // range, stride (expressions)
                 *current += 1;
                 let range = build_expression(egraph, trajectory, current);
                 *current += 1;
@@ -722,7 +708,7 @@ pub fn extraction_to_graph(
                     loop_level_map,
                     prev_placed,
                     already || no_place,
-                )?;
+                );
                 *current += 1;
                 let src_b = build_ir(
                     egraph,
@@ -732,7 +718,7 @@ pub fn extraction_to_graph(
                     loop_level_map,
                     prev_placed,
                     already || no_place,
-                )?;
+                );
 
                 *current += 1;
                 let a_k_stride = build_expression(egraph, trajectory, current);
@@ -787,7 +773,7 @@ pub fn extraction_to_graph(
                     loop_level_map,
                     prev_placed,
                     already || no_place,
-                )?;
+                );
                 *current += 1;
                 let child_two = build_ir(
                     egraph,
@@ -797,7 +783,7 @@ pub fn extraction_to_graph(
                     loop_level_map,
                     prev_placed,
                     already || no_place,
-                )?;
+                );
 
                 if no_place {
                     NodeIndex::default()
@@ -835,7 +821,7 @@ pub fn extraction_to_graph(
                     loop_level_map,
                     prev_placed,
                     already || no_place,
-                )?;
+                );
 
                 if no_place {
                     NodeIndex::default()
@@ -848,13 +834,8 @@ pub fn extraction_to_graph(
                     r
                 }
             }
-            op => {
-                if option_env!("PRINT_REJECT").is_some() {
-                    println!("unsupported IR op: {op}");
-                }
-                return None;
-            }
-        })
+            op => panic!("unsupported IR op: {op}"),
+        }
     }
 
     build_ir(
@@ -865,14 +846,14 @@ pub fn extraction_to_graph(
         loop_level_map,
         &mut FxHashMap::default(),
         false,
-    )?;
+    );
     for n in g.node_indices() {
         if g.neighbors_undirected(n).next().is_none() {
             display_graph(&g);
             panic!("free-standing node found in graph");
         }
     }
-    Some(g)
+    g
 }
 
 fn cost<'a>(

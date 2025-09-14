@@ -416,8 +416,9 @@
 		(saturate expr)
 		(saturate fusion)
 	)
-	;(saturate ir-prop)
-	;(saturate tc)
+	(saturate ir-prop)
+	(saturate tc)
+	(saturate ir-prop)
 )
 
 ;(print-size)
