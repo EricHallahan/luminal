@@ -156,7 +156,11 @@ pub fn codegen(
             .map(|(v, n)| (n, (v, true)))
             .collect::<HashMap<_, _>>();
         for (_, (n, _)) in &node_to_var {
-            arch.add_metal_buffer_type(*n, "device ");
+            match arch {
+                GPUArch::Metal(_) => arch.add_pointer_qualifier(*n, "device "),
+                GPUArch::OpenCL(_) => arch.add_pointer_qualifier(*n, "__global "),
+                _ => {}
+            }
         }
         let mut loop_levels = vec![];
         let kernel = make_kernel(
@@ -255,6 +259,28 @@ kernel void kernel_name(
 {kernel_lines}
 }}",
                     input_string.join("\n\t")
+                )
+            }
+            GPUArch::OpenCL(_) => {
+                let mut args = vec![];
+                args.extend(
+                    inputs
+                        .into_iter()
+                        .map(|(_, a)| a)
+                        .chain(outputs.iter().map(|(_, i)| *i))
+                        .map(|a| format!("__global float* {}", var_to_char(node_to_var[&a].0))),
+                );
+                args.extend(
+                    dyn_vars
+                        .iter()
+                        .sorted_by_key(|(k, _)| **k)
+                        .map(|(c, _)| format!("const int const_{c}")),
+                );
+                format!(
+                    "__kernel void kernel_name({}) {{
+{kernel_lines}
+}}",
+                    args.join(", ")
                 )
             }
         };
@@ -455,10 +481,14 @@ fn make_kernel(
                         }
                         // Make accumulator
                         *prev_max_var += 1;
-                        arch.add_metal_buffer_type(*prev_max_var, "thread ");
+                        let qualifier = match &*arch {
+                            GPUArch::Metal(_) => "thread ",
+                            _ => "",
+                        };
+                        arch.add_pointer_qualifier(*prev_max_var, qualifier);
                         kernel_lines.push(format!(
                             "{spacing}{}float {}[{}] = {{0.0}};",
-                            arch.metal_buffer_type(*prev_max_var),
+                            arch.pointer_qualifier(*prev_max_var),
                             var_to_char(*prev_max_var),
                             size.to_usize().unwrap()
                         ));
@@ -508,14 +538,18 @@ fn make_kernel(
                         }
                         // We don't have a place to save this output to. Need to allocate a register buffer
                         *prev_max_var += 1;
+                        let qualifier = match &*arch {
+                            GPUArch::Metal(_) => "thread ",
+                            _ => "",
+                        };
                         kernel_lines.push(format!(
-                            "{spacing}thread float {}[{}] = {{0.0}};",
+                            "{spacing}{qualifier}float {}[{}] = {{0.0}};",
                             var_to_char(*prev_max_var),
                             size.to_usize().unwrap()
                         ));
                         node_to_var.insert(*output, (*prev_max_var, true));
                         created_buffers.insert(*output, *prev_max_var);
-                        arch.add_metal_buffer_type(*prev_max_var, "thread ");
+                        arch.add_pointer_qualifier(*prev_max_var, qualifier);
                     }
                 }
 
@@ -535,10 +569,9 @@ fn make_kernel(
                             "int loop_{} = {};",
                             var_to_char(*prev_max_var),
                             if current_loop_level >= GRID_DIMS {
-                                ["threadIdx.x", "threadIdx.y", "threadIdx.z"]
-                                    [current_loop_level - GRID_DIMS]
+                                arch.thread_ids()[current_loop_level - GRID_DIMS]
                             } else {
-                                ["blockIdx.x", "blockIdx.y", "blockIdx.z"][current_loop_level]
+                                arch.block_ids()[current_loop_level]
                             }
                         ));
                     }
@@ -566,13 +599,13 @@ fn make_kernel(
                             node_to_var.insert(*input, (real_input, is_ptr));
                         } else {
                             *prev_max_var += 1;
-                            arch.add_metal_buffer_type(
+                            arch.add_pointer_qualifier(
                                 *prev_max_var,
-                                arch.metal_buffer_type(real_input),
+                                arch.pointer_qualifier(real_input),
                             );
                             kernel_lines.push(format!(
                                 "{inner_spacing}{}float* {} = {} + {};",
-                                arch.metal_buffer_type(*prev_max_var),
+                                arch.pointer_qualifier(*prev_max_var),
                                 var_to_char(*prev_max_var),
                                 var_to_char(real_input),
                                 stride
@@ -602,13 +635,13 @@ fn make_kernel(
                         } else {
                             assert!(is_ptr, "Only pointers can be offset!");
                             *prev_max_var += 1;
-                            arch.add_metal_buffer_type(
+                            arch.add_pointer_qualifier(
                                 *prev_max_var,
-                                arch.metal_buffer_type(real_output),
+                                arch.pointer_qualifier(real_output),
                             );
                             kernel_lines.push(format!(
                                 "{inner_spacing}{}float* {} = {} + {};",
-                                arch.metal_buffer_type(*prev_max_var),
+                                arch.pointer_qualifier(*prev_max_var),
                                 var_to_char(*prev_max_var),
                                 var_to_char(real_output),
                                 stride
@@ -620,13 +653,13 @@ fn make_kernel(
                         }
                     } else if let Some(real_output) = created_buffers.get(output) {
                         *prev_max_var += 1;
-                        arch.add_metal_buffer_type(
+                        arch.add_pointer_qualifier(
                             *prev_max_var,
-                            arch.metal_buffer_type(*real_output),
+                            arch.pointer_qualifier(*real_output),
                         );
                         kernel_lines.push(format!(
                             "{inner_spacing}{}float* {} = {} + {};",
-                            arch.metal_buffer_type(*prev_max_var),
+                            arch.pointer_qualifier(*prev_max_var),
                             var_to_char(*prev_max_var),
                             var_to_char(*real_output),
                             stride
@@ -792,9 +825,10 @@ fn make_kernel(
                 let (gmem, gmem_ptr) = node_to_var[&gmem];
                 let (smem, smem_ptr) = node_to_var[&smem];
                 assert!(smem_ptr);
-                let sync_barrier = match arch {
+                let sync_barrier = match &*arch {
                     GPUArch::CUDA => "__syncthreads()",
                     GPUArch::Metal(_) => "threadgroup_barrier(mem_flags::mem_threadgroup)",
+                    GPUArch::OpenCL(_) => "barrier(CLK_LOCAL_MEM_FENCE)",
                 };
                 match term {
                     GraphTerm::SMEMLoad => {
@@ -862,14 +896,14 @@ fn make_kernel(
                     GraphTerm::LessThan => format!("(float)({inp_a} < {inp_b})"),
                     GraphTerm::Mod => format!(
                         "{}({inp_a}, {inp_b})",
-                        if matches!(arch, GPUArch::Metal(_)) {
+                        if matches!(&*arch, GPUArch::Metal(_) | GPUArch::OpenCL(_)) {
                             "fmod"
                         } else {
                             "__mod"
                         }
                     ),
                     GraphTerm::Max => {
-                        if matches!(arch, GPUArch::Metal(_)) {
+                        if matches!(&*arch, GPUArch::Metal(_) | GPUArch::OpenCL(_)) {
                             format!("fmax({inp_a}, {inp_b})")
                         } else {
                             format!("{inp_a} > {inp_b} ? {inp_a} : {inp_b}")
@@ -890,9 +924,10 @@ fn make_kernel(
                 c_inner_stride,
                 k_outer_loops,
             } => {
-                if cfg!(feature = "cuda") {
-                    // CUDA build: skip / fallback
-                    return None; // or generate a non-TC matmul
+                // This is a Metal-specific implementation.
+                if !matches!(&*arch, GPUArch::Metal(_)) {
+                    // Fallback for CUDA and OpenCL
+                    return None;
                 }
 
                 let mut srcs = kernel_graph

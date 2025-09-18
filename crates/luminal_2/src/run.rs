@@ -1,5 +1,4 @@
 use itertools::Itertools;
-
 #[cfg(feature = "cuda")]
 use {
     cudarc::{driver::*, nvrtc::CompileOptions},
@@ -18,8 +17,20 @@ use luminal::{
     },
     shape::Expression,
 };
+
+#[cfg(feature = "opencl")]
+use opencl3::{
+    command_queue::CommandQueue,
+    context::Context,
+    kernel::{ExecuteKernel, Kernel as OclKernel},
+    memory::{Buffer as OclBuffer, CL_MEM_READ_WRITE},
+    program::Program,
+};
 use rustc_hash::FxHashMap;
-use std::{fs::File, io::Read};
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use std::{fs::File, io::Read, mem::size_of};
+
 #[cfg(feature = "metal")]
 use {
     crate::{Buffer, Device, Function},
@@ -160,6 +171,27 @@ pub fn compile_kernels(
     compiled
 }
 
+#[cfg(feature = "opencl")]
+pub fn compile_kernels(
+    kernels: &StableGraph<Kernel, (usize, usize)>,
+    context: &Context,
+) -> FxHashMap<String, OclKernel> {
+    let mut compiled = FxHashMap::default();
+    for kernel in kernels.node_weights() {
+        if !compiled.contains_key(&kernel.code)
+            && kernel.code != "Inputs"
+            && kernel.code != "Outputs"
+        {
+            let program =
+                Program::create_and_build_from_source(context, &kernel.code, "-cl-std=CL1.2")
+                    .unwrap();
+            let ocl_kernel = OclKernel::create(&program, "kernel_name").unwrap();
+            compiled.insert(kernel.code.clone(), ocl_kernel);
+        }
+    }
+    compiled
+}
+
 #[cfg(feature = "cuda")]
 pub fn run_graph(
     inputs: &mut FxHashMap<usize, (CudaSlice<f32>, bool)>,
@@ -220,7 +252,7 @@ pub fn run_graph(
             file.read_to_end(&mut file_buffer).unwrap();
             assert_eq!(file_buffer.len() % std::mem::size_of::<f32>(), 0);
 
-            let num_floats = file_buffer.len() / std::mem::size_of::<f32>();
+            let _num_floats = file_buffer.len() / std::mem::size_of::<f32>();
             let floats: Vec<f32> = file_buffer
                 .chunks_exact(4)
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -463,8 +495,6 @@ pub fn run_graph(
                 for (_, v) in dyn_vars.iter().sorted_by_key(|(k, _)| **k) {
                     let val: u64 = *v as u64;
                     let buf = unsafe {
-                        use std::{ffi::c_void, ptr::NonNull};
-
                         use objc2_metal::MTLResourceOptions;
 
                         device
@@ -516,6 +546,123 @@ pub fn run_graph(
     })
 }
 
+#[cfg(feature = "opencl")]
+pub fn run_graph(
+    inputs: &mut FxHashMap<usize, (OclBuffer<f32>, bool)>,
+    kernels: &StableGraph<Kernel, (usize, usize)>,
+    dyn_vars: &FxHashMap<char, usize>,
+    compiled_kernels: &FxHashMap<String, OclKernel>,
+    intermediate_buffers: &Vec<Expression>,
+    intermediate_buffer_map: &FxHashMap<NodeIndex, Vec<usize>>,
+    context: &Context,
+    queue: &CommandQueue,
+) -> (Vec<OclBuffer<f32>>, u128) {
+    let start = std::time::Instant::now();
+
+    // Allocate intermediate buffers
+    let mut buffers = intermediate_buffers
+        .iter()
+        .map(|e| {
+            let size = e.exec(dyn_vars).unwrap();
+            unsafe {
+                OclBuffer::<f32>::create(context, CL_MEM_READ_WRITE, size, std::ptr::null_mut())
+            }
+            .unwrap()
+        })
+        .collect_vec();
+    let input_node = kernels
+        .node_indices()
+        .find(|n| kernels[*n].code == "Inputs")
+        .unwrap();
+
+    for node in toposort(kernels, None).unwrap() {
+        let kernel = &kernels[node];
+        if kernel.code == "Inputs" {
+            // Inputs provided
+        } else if kernel.code == "Outputs" {
+            queue.finish().unwrap();
+            let outputs = kernels
+                .edges_directed(node, Direction::Incoming)
+                .map(|e| {
+                    (
+                        e.weight().1,
+                        intermediate_buffer_map[&e.source()][e.weight().0],
+                    )
+                })
+                .sorted_by_key(|(_, b)| *b)
+                .rev()
+                .map(|(a, b)| (a, buffers.remove(b)))
+                .sorted_by_key(|(a, _)| *a)
+                .map(|(_, a)| a)
+                .collect_vec();
+            return (outputs, start.elapsed().as_micros());
+        } else if kernel.code.starts_with("Diff") {
+            // Not implemented for OpenCL yet, but this should be fine
+        } else {
+            let kernel_fn = &compiled_kernels[&kernel.code];
+            let mut exec_kernel = ExecuteKernel::new(kernel_fn);
+
+            // set inputs
+            for (input, input_index) in kernels
+                .edges_directed(node, Direction::Incoming)
+                .sorted_by_key(|n| n.weight().1)
+                .map(|n| (n.source(), n.weight().0))
+            {
+                let buffer: &OclBuffer<f32> = if input == input_node {
+                    &inputs[&input_index].0
+                } else {
+                    &buffers[intermediate_buffer_map[&input][input_index]]
+                };
+                unsafe { exec_kernel.set_arg(buffer) };
+            }
+
+            // set output
+            for o in 0..kernel.outputs.len() {
+                let buffer = &buffers[intermediate_buffer_map[&node][o]];
+                unsafe { exec_kernel.set_arg(buffer) };
+            }
+
+            // set dynamic dimensions
+            for (_, v) in dyn_vars.iter().sorted_by_key(|(k, _)| **k) {
+                let val: i32 = *v as i32;
+                unsafe { exec_kernel.set_arg(&val) };
+            }
+
+            // set shared mem
+            if kernel.code.contains("__local float* sm") {
+                unsafe {
+                    exec_kernel.set_arg_local_buffer(
+                        kernel.smem.exec(dyn_vars).unwrap() * std::mem::size_of::<f32>(),
+                    );
+                }
+            }
+
+            // Set dispatch
+            let grid = [
+                kernel.grid.0.exec(dyn_vars).unwrap(),
+                kernel.grid.1.exec(dyn_vars).unwrap(),
+                kernel.grid.2.exec(dyn_vars).unwrap(),
+            ];
+            let tb = [
+                kernel.threadblock.0.exec(dyn_vars).unwrap(),
+                kernel.threadblock.1.exec(dyn_vars).unwrap(),
+                kernel.threadblock.2.exec(dyn_vars).unwrap(),
+            ];
+            let global_work_size = [grid[0] * tb[0], grid[1] * tb[1], grid[2] * tb[2]];
+
+            unsafe {
+                exec_kernel
+                    .set_global_work_sizes(&global_work_size)
+                    .set_local_work_sizes(&tb)
+                    .enqueue_nd_range(queue)
+                    .unwrap();
+            }
+        }
+    }
+    panic!("No output kernel detected in graph!");
+}
+
+#[cfg(feature = "metal")]
 pub fn run_graph_per_cb(
     inputs: &mut FxHashMap<usize, (Buffer, bool)>,
     kernels: &StableGraph<Kernel, (usize, usize)>,
@@ -590,11 +737,12 @@ pub fn run_graph_per_cb(
                     .next()
                     .unwrap();
                 let buffer = &buffers[intermediate_buffer_map[&input][input_index]];
-                let mut data = vec![0_f32; buffer.length() as usize / core::mem::size_of::<f32>()];
+                let mut data =
+                    vec![0_f32; buffer.length() as usize / core::mem::size_of::<f32>()];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         buffer.contents().as_ptr() as *const _,
-                        &mut data,
+                        data.as_mut_ptr(),
                         data.len(),
                     );
                 }
@@ -603,11 +751,11 @@ pub fn run_graph_per_cb(
                 file.read_to_end(&mut file_buffer).unwrap();
                 assert_eq!(file_buffer.len() % core::mem::size_of::<f32>(), 0);
 
-                let num_floats = file_buffer.len() / core::mem::size_of::<f32>();
-                let floats: Vec<f32> = unsafe {
-                    let ptr = file_buffer.as_ptr() as *const f32;
-                    Vec::from_raw_parts(ptr as *mut f32, num_floats, num_floats)
-                };
+                let _num_floats = file_buffer.len() / core::mem::size_of::<f32>();
+                let floats: Vec<f32> = file_buffer
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
                 let mut matched = true;
                 println!("Diff {} | {}", data.len(), floats.len());
                 for (ind, (i, j)) in data.iter().zip(floats).enumerate() {
@@ -617,14 +765,13 @@ pub fn run_graph_per_cb(
                         break;
                     }
                 }
-                core::mem::forget(file_buffer);
                 if matched {
                     println!("DIFF {diff_name} MATCHED");
                 }
                 let dest_buffer = &mut buffers[intermediate_buffer_map[&node][0]];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        &data,
+                        data.as_ptr(),
                         dest_buffer.contents().as_ptr() as *mut _,
                         data.len(),
                     );
