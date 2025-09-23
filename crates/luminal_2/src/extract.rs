@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::mem::size_of;
 use std::usize;
 
 use crate::codegen::codegen;
@@ -7,7 +8,7 @@ use crate::debug::display_graph;
 use crate::run::{assign_buffers, compile_kernels, htod, new_buffer, run_graph};
 use crate::translate::InitData;
 use crate::utils::{build_search_space, print_kernels};
-use crate::{Buffer, Kernel};
+use crate::{Buffer, Device, Kernel};
 use crate::{GPUArch, GraphTerm};
 use colored::Colorize;
 #[cfg(feature = "cuda")]
@@ -19,13 +20,21 @@ use luminal::prelude::petgraph::prelude::StableGraph;
 use luminal::prelude::petgraph::{Directed, Direction};
 use luminal::shape::{Expression, Term};
 #[cfg(feature = "metal")]
-use objc2_metal::MTLCreateSystemDefaultDevice;
-use rand::{Rng, rng};
+use objc2_metal::{MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
+#[cfg(feature = "opencl")]
+use opencl3::{
+    command_queue::CommandQueue,
+    context::Context,
+    device::{Device as OclDevice, CL_DEVICE_TYPE_GPU},
+    platform::get_platforms,
+};
+
+use rand::{rng, Rng};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 const WARMUP_TRIALS: usize = 0;
 const TRIALS: usize = 1;
-const MAX_SEARCHED_GRAPHS: usize = 1_000;
+const MAX_SEARCHED_GRAPHS: usize = 16384;
 const MAX_CYCLES: usize = 1;
 const INVALID_IR: &[&str] = &[
     "SwapLoops",
@@ -367,6 +376,16 @@ pub fn search(
     let device = MTLCreateSystemDefaultDevice().unwrap();
     #[cfg(feature = "cuda")]
     let device = CudaContext::new(0).unwrap();
+    #[cfg(feature = "opencl")]
+    let device = {
+        let platforms = get_platforms().unwrap();
+        let platform = platforms.first().unwrap();
+        let device_ids = platform.get_devices(CL_DEVICE_TYPE_GPU).unwrap();
+        let ocl_device = OclDevice::new(*device_ids.first().unwrap());
+        let context = Context::from_device(&ocl_device).unwrap();
+        let queue = unsafe { CommandQueue::create_with_properties(&context, ocl_device.id(), 0, 0).unwrap() };
+        Device { context, queue }
+    };
     let inputs = inputs
         .into_iter()
         .map(|(n, init)| {
@@ -384,6 +403,7 @@ pub fn search(
         &map_inputs_into_kernel_graph(&inputs, &ref_graph),
         &ref_gmem_map,
         dyn_vars,
+        &device,
     )
     .unwrap();
 
@@ -488,6 +508,7 @@ pub fn search(
             &map_inputs_into_kernel_graph(&inputs, &graph),
             &gmem_mapping,
             dyn_vars,
+            &device,
         ) {
             valid_graphs += 1;
             if let Some((progress, logs, title, _)) = &ui_functions {
@@ -864,11 +885,16 @@ fn map_inputs_into_kernel_graph<'a>(
     graph: &StableGraph<GraphTerm, ()>,
 ) -> Vec<(NodeIndex, &'a Buffer)> {
     inputs
-    	.iter()
-     	.filter_map(|(l, d)|
-    		graph.node_indices().find(|n| matches!(graph.node_weight(*n).unwrap(), GraphTerm::GMEM { label } if label == l)).map(|i| (i, d))
-      	)
-      	.collect()
+        .iter()
+        .filter_map(|(l, d)| {
+            graph
+                .node_indices()
+                .find(|n| {
+                    matches!(graph.node_weight(*n).unwrap(), GraphTerm::GMEM { label } if label == l)
+                })
+                .map(|i| (i, d))
+        })
+        .collect()
 }
 
 fn cost<'a>(
@@ -876,6 +902,7 @@ fn cost<'a>(
     inputs: &[(NodeIndex, &Buffer)],
     gmem_mapping: &HashMap<NodeIndex, usize>,
     dyn_vars: &FxHashMap<char, usize>,
+    device: &Device,
 ) -> Option<(Cost, Vec<Vec<f32>>)> {
     // Get buffer info
     let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
@@ -885,7 +912,16 @@ fn cost<'a>(
             return None;
         }
     }
-    let compiled_kernels = compile_kernels(&kernels);
+    let compiled_kernels = {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        {
+            compile_kernels(&kernels)
+        }
+        #[cfg(feature = "opencl")]
+        {
+            compile_kernels(&kernels, &device.context)
+        }
+    };
     // Set up input buffers
     let mut inputs = inputs
         .into_iter()
@@ -895,7 +931,7 @@ fn cost<'a>(
     // Allocate intermediate buffers
     let mut buffers = int_buffers
         .iter()
-        .map(|e| new_buffer(e.exec(dyn_vars).unwrap() * size_of::<f32>()))
+        .map(|e| new_buffer(e.exec(dyn_vars).unwrap() * size_of::<f32>(), device))
         .collect_vec();
 
     // Warm up resources (buffer allocation, kernel compiler, etc.)
@@ -907,6 +943,7 @@ fn cost<'a>(
             &compiled_kernels,
             &mut buffers,
             &int_buffer_map,
+            device,
         );
     }
     // Test runtime
@@ -922,6 +959,7 @@ fn cost<'a>(
                 &compiled_kernels,
                 &mut buffers,
                 &int_buffer_map,
+                device,
             )
         };
         outputs = o;

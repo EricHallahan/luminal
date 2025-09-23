@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::c_void, ptr::NonNull};
+use std::{collections::HashMap, ffi::c_void};
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::*;
@@ -18,6 +18,15 @@ use luminal_2::{
 use luminal_2::{Buffer, Device};
 #[cfg(feature = "metal")]
 use objc2_metal::{MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
+#[cfg(feature = "opencl")]
+use opencl3::{
+    command_queue::{CL_QUEUE_PROFILING_ENABLE, CommandQueue},
+    context::Context,
+    device::{Device as OclDevice, CL_DEVICE_TYPE_GPU},
+    memory::{Buffer, ClMem, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_WRITE},
+    platform::get_platforms,
+    types::CL_TRUE,
+};
 use rand::{rng, Rng};
 use rustc_hash::FxHashMap;
 
@@ -27,7 +36,7 @@ fn with_autoreleasepool<F: FnOnce()>(f: F) {
     objc2::rc::autoreleasepool(|_| f());
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 #[inline]
 fn with_autoreleasepool<F: FnOnce()>(f: F) {
     f();
@@ -39,9 +48,11 @@ fn main() {
         let arch = GPUArch::Metal(HashMap::default());
         #[cfg(feature = "cuda")]
         let arch = GPUArch::CUDA;
+        #[cfg(feature = "opencl")]
+        let arch = GPUArch::OpenCL(HashMap::default());
 
         #[allow(non_snake_case)]
-        let (hidden, intermediate) = (4096, 14336); // llama numbers divided by 8
+        let (hidden, intermediate) = (512, 1792); // llama numbers divided by 8
         let mut cx = Graph::new();
         let a = cx.named_tensor("Input", (8, hidden));
         let gate = cx.named_tensor("Gate", (hidden, intermediate));
@@ -122,13 +133,52 @@ fn main() {
         }
         let (kernels, gmem_mapping) = codegen(graph.clone(), arch, &HashMap::default()).unwrap();
 
-        let compiled = compile_kernels(&kernels);
-        let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
-
         #[cfg(feature = "metal")]
-        let device = &MTLCreateSystemDefaultDevice().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         #[cfg(feature = "cuda")]
-        let device = &CudaContext::new(0).unwrap();
+        let device = CudaContext::new(0).unwrap();
+        #[cfg(feature = "opencl")]
+        let device = {
+            let platforms = get_platforms().unwrap();
+            let platform = platforms.first().unwrap();
+            println!("{}", platform.name().unwrap());
+            let device_ids = platform.get_devices(CL_DEVICE_TYPE_GPU).unwrap();
+            let ocl_device = OclDevice::new(*device_ids.first().unwrap());
+            println!("{}", ocl_device.name().unwrap());
+            let context = Context::from_device(&ocl_device).unwrap();
+            let queue = unsafe {
+                CommandQueue::create_with_properties(
+                    &context,
+                    ocl_device.id(),
+                    CL_QUEUE_PROFILING_ENABLE,
+                    0,
+                )
+                .unwrap()
+            };
+            luminal_2::Device { context, queue }
+        };
+
+        let compiled = {
+            #[cfg(any(feature = "metal", feature = "cuda"))]
+            {
+                compile_kernels(&kernels)
+            }
+            #[cfg(feature = "opencl")]
+            {
+                compile_kernels(&kernels, &device.context)
+            }
+        };
+
+        let (int_buffer_exprs, int_buffer_map) = assign_buffers(&kernels);
+        let mut int_buffers = int_buffer_exprs
+            .iter()
+            .map(|e| {
+                new_buffer(
+                    e.exec(&FxHashMap::default()).unwrap() * std::mem::size_of::<f32>(),
+                    &device,
+                )
+            })
+            .collect_vec();
 
         let mut inputs = FxHashMap::default();
         let mut rng = rng();
@@ -139,7 +189,7 @@ fn main() {
                     &(0..1 * hidden)
                         .map(|_| rng.random_range(-1e-2..1e-2))
                         .collect_vec(),
-                    device,
+                    &device,
                 ),
                 false,
             ),
@@ -151,7 +201,7 @@ fn main() {
                     &(0..hidden * intermediate)
                         .map(|_| rng.random_range(-1e-2..1e-2))
                         .collect_vec(),
-                    device,
+                    &device,
                 ),
                 false,
             ),
@@ -163,7 +213,7 @@ fn main() {
                     &(0..hidden * intermediate)
                         .map(|_| rng.random_range(-1e-2..1e-2))
                         .collect_vec(),
-                    device,
+                    &device,
                 ),
                 false,
             ),
@@ -175,7 +225,7 @@ fn main() {
                     &(0..intermediate * hidden)
                         .map(|_| rng.random_range(-1e-2..1e-2))
                         .collect_vec(),
-                    device,
+                    &device,
                 ),
                 false,
             ),
@@ -188,30 +238,28 @@ fn main() {
                             let val = e.exec(&cx.dyn_map).unwrap();
                             inputs.insert(*input_index, {
                                 let v = vec![val as f32];
-                                (copy_buffer(&v, device), true)
+                                (copy_buffer(&v, &device), true)
                             });
                         }
                         InitData::Data(d) => {
-                            inputs.insert(*input_index, (copy_buffer(d, device), true));
+                            inputs.insert(*input_index, (copy_buffer(d, &device), true));
                         }
                     }
                 }
             }
         }
 
-        let mut buffers = int_buffers
-            .iter()
-            .map(|e| new_buffer(e.exec(&cx.dyn_map).unwrap() * size_of::<f32>()))
-            .collect_vec();
-        let mut inp = inputs.iter().map(|(i, (b, v))| (*i, (b, *v))).collect();
         let (outputs, _) = {
+            let mut inputs_ref: FxHashMap<_, _> =
+                inputs.iter().map(|(k, (v, b))| (*k, (v, *b))).collect();
             run_graph(
-                &mut inp,
+                &mut inputs_ref,
                 &kernels,
                 &FxHashMap::default(),
                 &compiled,
-                &mut buffers,
+                &mut int_buffers,
                 &int_buffer_map,
+                &device,
             )
         };
         println!("{:?}", &outputs[0][..10]);
@@ -256,4 +304,30 @@ pub fn copy_buffer_back(v: &Buffer) -> Vec<f32> {
         *d = unsafe { *ptr.add(i) };
     }
     data
+}
+
+#[cfg(feature = "opencl")]
+pub fn copy_buffer(v: &[f32], device: &luminal_2::Device) -> Buffer<f32> {
+    unsafe {
+        Buffer::<f32>::create(
+            &device.context,
+            CL_MEM_COPY_HOST_PTR | CL_MEM_READ_WRITE,
+            v.len(),
+            v.as_ptr() as *mut c_void,
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(feature = "opencl")]
+pub fn copy_buffer_back(buffer: &Buffer<f32>, device: &luminal_2::Device) -> Vec<f32> {
+    let mut vec = vec![0.0; buffer.size().unwrap() / std::mem::size_of::<f32>()];
+    let event = unsafe {
+        device
+            .queue
+            .enqueue_read_buffer(buffer, CL_TRUE, 0, &mut vec, &[])
+            .unwrap()
+    };
+    event.wait().unwrap();
+    vec
 }

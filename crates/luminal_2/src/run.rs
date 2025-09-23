@@ -15,8 +15,16 @@ use luminal::{
     },
     shape::Expression,
 };
+
+#[cfg(feature = "opencl")]
+use opencl3::{
+    context::Context,
+    kernel::{ExecuteKernel, Kernel as OclKernel},
+    memory::{Buffer as OclBuffer, ClMem, CL_MEM_READ_WRITE},
+    program::Program,
+};
 use rustc_hash::FxHashMap;
-use std::{fs::File, io::Read};
+use std::{ffi::c_void, fs::File, io::Read, mem::size_of};
 #[cfg(feature = "metal")]
 use {
     crate::{Device, Function},
@@ -24,7 +32,6 @@ use {
     std::{ffi::c_void, ptr::NonNull},
 };
 
-use crate::Buffer;
 #[cfg(feature = "cuda")]
 use crate::GraphTerm;
 use crate::Kernel;
@@ -117,6 +124,34 @@ pub fn compile_kernels(
             .unwrap();
             let module = ctx.load_module(ptx).unwrap();
             let k = module.load_function("kernel_name").unwrap();
+            compiled.insert(kernel.code.clone(), k);
+        }
+    }
+    compiled
+}
+
+#[cfg(feature = "opencl")]
+pub fn compile_kernels(
+    kernels: &StableGraph<Kernel, (usize, usize)>,
+    context: &Context,
+) -> FxHashMap<String, OclKernel> {
+    let mut compiled = FxHashMap::default();
+    for kernel in kernels.node_weights() {
+        if !compiled.contains_key(&kernel.code)
+            && kernel.code != "Inputs"
+            && kernel.code != "Outputs"
+            //&& !kernel.code.starts_with("Diff")
+        {
+            /*println!("{}", kernel.code);
+            if kernel.code.is_empty() {
+                continue;
+            }*/
+            let program =
+                Program::create_and_build_from_source(context, &kernel.code, "-cl-std=CL1.2")
+                    .unwrap();
+            //let mut program = Program::create_from_source(context, &kernel.code).unwrap();
+            //program.build(&[], "").unwrap();
+            let k = OclKernel::create(&program, "kernel_name").unwrap();
             compiled.insert(kernel.code.clone(), k);
         }
     }
@@ -294,6 +329,139 @@ pub fn run_graph(
             //     .unwrap();
             //     panic!("{:?}", e);
             // }
+        }
+    }
+    panic!("No output kernel detected in graph!");
+}
+
+#[cfg(feature = "opencl")]
+pub fn run_graph(
+    inputs: &mut FxHashMap<usize, (&OclBuffer<f32>, bool)>,
+    kernels: &StableGraph<Kernel, (usize, usize)>,
+    dyn_vars: &FxHashMap<char, usize>,
+    compiled_kernels: &FxHashMap<String, OclKernel>,
+    intermediate_buffers: &mut Vec<OclBuffer<f32>>,
+    intermediate_buffer_map: &FxHashMap<NodeIndex, Vec<usize>>,
+    device: &crate::Device,
+) -> (Vec<Vec<f32>>, u128) {
+    let queue = &device.queue;
+    let start = std::time::Instant::now();
+
+    let input_node = kernels
+        .node_indices()
+        .find(|n| kernels[*n].code == "Inputs")
+        .unwrap();
+    for node in toposort(kernels, None).unwrap() {
+        let kernel = &kernels[node];
+        if kernel.code == "Inputs" {
+            // Inputs are handled by consumers
+        } else if kernel.code == "Outputs" {
+            queue.finish().unwrap();
+            let outputs = kernels
+                .edges_directed(node, Direction::Incoming)
+                .map(|e| {
+                    (
+                        e.weight().1,
+                        intermediate_buffer_map[&e.source()][e.weight().0],
+                    )
+                })
+                .sorted_by_key(|(_, b)| *b)
+                .rev()
+                .map(|(a, b)| (a, dtoh(&intermediate_buffers[b], device)))
+                .sorted_by_key(|(a, _)| *a)
+                .map(|(_, a)| a)
+                .collect_vec();
+            return (outputs, start.elapsed().as_micros());
+        } else if kernel.code.starts_with("Diff") {
+            let diff_name = kernel.code.replace("Diff", "");
+            let (input, input_index) = kernels
+                .edges_directed(node, Direction::Incoming)
+                .sorted_by_key(|n| n.weight().1)
+                .map(|n| (n.source(), n.weight().0))
+                .next()
+                .unwrap();
+            let buffer = &intermediate_buffers[intermediate_buffer_map[&input][input_index]];
+            let data = dtoh(buffer, device);
+
+            let mut file = File::open(format!("{diff_name}.bin")).unwrap();
+            let mut file_buffer = Vec::new();
+            file.read_to_end(&mut file_buffer).unwrap();
+            assert_eq!(file_buffer.len() % std::mem::size_of::<f32>(), 0);
+
+            let floats: Vec<f32> = file_buffer
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            let mut matched = true;
+            println!("Diff {} | {}", data.len(), floats.len());
+            for (ind, (i, j)) in data.iter().zip(floats).enumerate() {
+                if (i - j).abs() > 1e-5 {
+                    matched = false;
+                    println!("Diff {diff_name} failed: curr: {i} != file: {j}, index {ind}");
+                    break;
+                }
+            }
+
+            if matched {
+                println!("DIFF {diff_name} MATCHED");
+            }
+            let dest_buffer = &mut intermediate_buffers[intermediate_buffer_map[&node][0]];
+            let event = unsafe {
+                queue
+                    .enqueue_write_buffer(dest_buffer, opencl3::types::CL_TRUE, 0, &data, &[])
+                    .unwrap()
+            };
+            event.wait().unwrap();
+        } else {
+            let ocl_kernel = &compiled_kernels[&kernel.code];
+            let mut kernel_exec = ExecuteKernel::new(ocl_kernel);
+
+            // set inputs
+            for (input, input_index) in kernels
+                .edges_directed(node, Direction::Incoming)
+                .sorted_by_key(|n| n.weight().1)
+                .map(|n| (n.source(), n.weight().0))
+            {
+                let buffer = if input == input_node {
+                    inputs[&input_index].0
+                } else {
+                    &intermediate_buffers[intermediate_buffer_map[&input][input_index]]
+                };
+                unsafe { kernel_exec.set_arg(buffer) };
+            }
+
+            // set outputs
+            for o in 0..kernel.outputs.len() {
+                let buffer = &intermediate_buffers[intermediate_buffer_map[&node][o]];
+                unsafe { kernel_exec.set_arg(buffer) };
+            }
+
+            // set dynamic dimensions
+            for (_, v) in dyn_vars.iter().sorted_by_key(|(k, _)| **k) {
+                let val: i32 = *v as i32;
+                unsafe { kernel_exec.set_arg(&val) };
+            }
+
+            let grid = [
+                kernel.grid.0.exec(dyn_vars).unwrap(),
+                kernel.grid.1.exec(dyn_vars).unwrap(),
+                kernel.grid.2.exec(dyn_vars).unwrap(),
+            ];
+            let tb = [
+                kernel.threadblock.0.exec(dyn_vars).unwrap(),
+                kernel.threadblock.1.exec(dyn_vars).unwrap(),
+                kernel.threadblock.2.exec(dyn_vars).unwrap(),
+            ];
+
+            let global_work_size = [(grid[0] * tb[0]), (grid[1] * tb[1]), (grid[2] * tb[2])];
+
+            unsafe {
+                kernel_exec
+                    .set_global_work_sizes(&global_work_size)
+                    .set_local_work_sizes(&tb)
+                    .enqueue_nd_range(queue)
+                    .unwrap();
+            }
         }
     }
     panic!("No output kernel detected in graph!");
@@ -507,6 +675,34 @@ pub fn run_graph(
     })
 }
 
+#[cfg(feature = "opencl")]
+pub fn htod(v: &[f32], device: &crate::Device) -> OclBuffer<f32> {
+    let context = &device.context;
+    assert!(!v.is_empty(), "Can't copy empty slice to device");
+    unsafe {
+        OclBuffer::<f32>::create(
+            context,
+            opencl3::memory::CL_MEM_COPY_HOST_PTR | opencl3::memory::CL_MEM_READ_WRITE,
+            v.len(),
+            v.as_ptr() as *mut c_void,
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(feature = "opencl")]
+pub fn dtoh(buffer: &OclBuffer<f32>, device: &crate::Device) -> Vec<f32> {
+    let queue = &device.queue;
+    let mut vec = vec![0.0; buffer.size().unwrap() / size_of::<f32>()];
+    let event = unsafe {
+        queue
+            .enqueue_read_buffer(buffer, opencl3::types::CL_TRUE, 0, &mut vec, &[])
+            .unwrap()
+    };
+    event.wait().unwrap();
+    vec
+}
+
 #[cfg(feature = "cuda")]
 pub fn htod(v: &[f32], ctx: &std::sync::Arc<CudaContext>) -> CudaSlice<f32> {
     assert!(!v.is_empty(), "Can't copy empty slice to device");
@@ -554,6 +750,20 @@ pub fn new_buffer(size: usize) -> Buffer {
         .unwrap()
         .newBufferWithLength_options(size, objc2_metal::MTLResourceOptions::StorageModeShared)
         .unwrap()
+}
+
+#[cfg(feature = "opencl")]
+pub fn new_buffer(size: usize, device: &crate::Device) -> OclBuffer<f32> {
+    let context = &device.context;
+    unsafe {
+        OclBuffer::<f32>::create(
+            context,
+            CL_MEM_READ_WRITE,
+            size / std::mem::size_of::<f32>(),
+            std::ptr::null_mut(),
+        )
+        .unwrap()
+    }
 }
 
 #[cfg(feature = "cuda")]

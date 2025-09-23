@@ -18,6 +18,8 @@ use luminal_cuda::CudaData;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 #[cfg(feature = "metal")]
 use objc2_metal::{MTLBuffer, MTLDevice, MTLFunction};
+#[cfg(feature = "opencl")]
+use opencl3::{command_queue::CommandQueue, context::Context, memory::Buffer as OclBuffer};
 #[cfg(feature = "cuda")]
 use std::fs::File;
 #[cfg(feature = "cuda")]
@@ -34,24 +36,45 @@ pub type Function = Retained<ProtocolObject<dyn MTLFunction>>;
 pub type Device = std::sync::Arc<luminal_cuda::CudaContext>;
 #[cfg(feature = "cuda")]
 pub type Buffer = cudarc::driver::CudaSlice<f32>;
+#[cfg(feature = "opencl")]
+pub struct Device {
+    pub context: Context,
+    pub queue: CommandQueue,
+}
+#[cfg(feature = "opencl")]
+pub type Buffer = OclBuffer<f32>;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum GPUArch {
     CUDA,
     Metal(HashMap<usize, &'static str>),
+    OpenCL(HashMap<usize, &'static str>),
 }
 
 impl GPUArch {
-    fn metal_buffer_type(&self, var: usize) -> &'static str {
+    fn pointer_qualifier(&self, var: usize) -> &'static str {
         match self {
-            Self::Metal(m) => m.get(&var).copied().unwrap_or(""),
+            Self::Metal(m) | Self::OpenCL(m) => m.get(&var).copied().unwrap_or(""),
             _ => "",
         }
     }
 
-    fn add_metal_buffer_type(&mut self, var: usize, buf_type: &'static str) {
-        if let Self::Metal(m) = self {
+    fn add_pointer_qualifier(&mut self, var: usize, buf_type: &'static str) {
+        if let Self::Metal(m) | Self::OpenCL(m) = self {
             m.insert(var, buf_type);
+        }
+    }
+
+    fn thread_ids(&self) -> [&'static str; 3] {
+        match self {
+            GPUArch::CUDA | GPUArch::Metal(_) => ["threadIdx.x", "threadIdx.y", "threadIdx.z"],
+            GPUArch::OpenCL(_) => ["get_local_id(0)", "get_local_id(1)", "get_local_id(2)"],
+        }
+    }
+    fn block_ids(&self) -> [&'static str; 3] {
+        match self {
+            GPUArch::CUDA | GPUArch::Metal(_) => ["blockIdx.x", "blockIdx.y", "blockIdx.z"],
+            GPUArch::OpenCL(_) => ["get_group_id(0)", "get_group_id(1)", "get_group_id(2)"],
         }
     }
 }
@@ -183,6 +206,13 @@ impl Operator for CompatKernel {
     }
 }
 
+#[cfg(feature = "opencl")]
+impl Operator for CompatKernel {
+    fn process(&mut self, _inputs: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        todo!()
+    }
+}
+
 pub fn custom_kernel(
     inputs: &[GraphTensor],
     kernel: Kernel,
@@ -224,6 +254,13 @@ impl Operator for Diff {
 }
 
 #[cfg(feature = "metal")]
+impl Operator for Diff {
+    fn process(&mut self, _inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        todo!()
+    }
+}
+
+#[cfg(feature = "opencl")]
 impl Operator for Diff {
     fn process(&mut self, _inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
         todo!()
